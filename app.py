@@ -11,31 +11,18 @@ df_tasks    = odoo_client.get_tasks()
 
 today = datetime.now().date()
 
-# 2) Converter datas
+# 2) Converter datas brutas
 df_tasks['date_end_dt']      = pd.to_datetime(df_tasks['date_end'],      errors='coerce').dt.date
 df_tasks['date_deadline_dt'] = pd.to_datetime(df_tasks['date_deadline'], errors='coerce').dt.date
 
 # 3) Extrair IDs de project_id e parent_id
-# Many2one vem como [id, nome] → pegamos o [0]
-if 'project_id' in df_tasks.columns:
-    df_tasks['project_id_id'] = df_tasks['project_id'].apply(
-        lambda v: v[0] if isinstance(v, (list, tuple)) else v
-    )
-else:
-    raise KeyError("Nenhuma coluna 'project_id' em df_tasks")
+df_tasks['project_id_id'] = df_tasks['project_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) else v)
+df_tasks['parent_id_id']  = df_tasks['parent_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
 
-if 'parent_id' in df_tasks.columns:
-    df_tasks['parent_id_id'] = df_tasks['parent_id'].apply(
-        lambda v: v[0] if isinstance(v, (list, tuple)) else None
-    )
-else:
-    # se não houver subtasks no seu read, define tudo como None
-    df_tasks['parent_id_id'] = None
-
-# 4) Filtrar apenas tarefas-pai (parent_id_id é None)
+# 4) Filtrar apenas tarefas-pai
 df_tasks = df_tasks[df_tasks['parent_id_id'].isna()].copy()
 
-# 5) Definir estados abertos / fechados
+# 5) Definir estados
 open_states   = ['01_in_progress', '02_changes_requested', '03_approved']
 closed_states = ['1_done', '1_canceled']
 
@@ -88,23 +75,24 @@ app.layout = html.Div(style={'padding': '20px', 'fontFamily': 'Arial, sans-serif
         style_header={'backgroundColor': '#007BFF', 'color': 'white', 'fontWeight': 'bold'},
         style_cell=common_style
     )], style={'marginTop': '30px'}),
+
     html.Div([html.H2('Tarefas do Projeto Selecionado'),
               dcc.Graph(id='tarefas-status-grafico'),
               dash_table.DataTable(
                   id='tasks-table',
                   columns=[
-                      {'name': 'Nome',       'id': 'name'},
-                      {'name': 'Criada em', 'id': 'create_date'},
-                      {'name': 'Prazo',     'id': 'date_deadline'},
-                      {'name': 'Concluída', 'id': 'concluida'},
-                      {'name': 'Status',    'id': 'status'}
+                      {'name': 'Nome',        'id': 'name'},
+                      {'name': 'Criada em',  'id': 'create_date'},
+                      {'name': 'Prazo',      'id': 'date_deadline'},
+                      {'name': 'Concluída',  'id': 'concluida'},
+                      {'name': 'Status',     'id': 'status'}
                   ],
                   data=[], filter_action='native', sort_action='native', sort_mode='multi',
                   style_table={'overflowX': 'auto', 'backgroundColor': 'white'},
                   style_header={'backgroundColor': '#007BFF', 'color': 'white', 'fontWeight': 'bold'},
                   style_cell=common_style,
                   style_data_conditional=[
-                      {'if': {'filter_query': '{status} = "Atrasada"'}, 'backgroundColor': '#FFCDD2'},
+                      {'if': {'filter_query': '{status} = "Atrasada"'},   'backgroundColor': '#FF0000', 'color': 'white'},
                       {'if': {'filter_query': '{status} = "Concluída"'}, 'backgroundColor': '#C8E6C9'}
                   ]
               )], style={'marginTop': '30px'})
@@ -116,10 +104,24 @@ def update_projects_graph(projects_data):
     df = pd.DataFrame(projects_data)
     if df.empty:
         return {}
-    return px.bar(df, x='name', y=['total_tasks','open_tasks','delayed_tasks'],
-                  barmode='group',
-                  labels={'name':'Departamento','value':'Quantidade','variable':'Tipo'},
-                  title='Resumo de Tarefas por Departamento')
+    fig = px.bar(df, x='name', y=['total_tasks','open_tasks','delayed_tasks'],
+                 barmode='group',
+                 labels={'name':'Departamento','value':'Quantidade','variable':'Tipo'},
+                 title='Resumo de Tarefas por Departamento',
+                 color_discrete_map={
+                     'total_tasks': '#636EFA',
+                     'open_tasks': '#00CC96',
+                     'delayed_tasks': '#FF0000'
+                 })
+    # legendas amigáveis
+    friendly = {
+        'total_tasks': 'Total',
+        'open_tasks':  'Em Aberto',
+        'delayed_tasks':'Atrasadas'
+    }
+    for trace in fig.data:
+        trace.name = friendly.get(trace.name, trace.name)
+    return fig
 
 @app.callback(
     Output('tasks-table','data'),
@@ -131,12 +133,23 @@ def update_tasks(selected_rows):
         return [], {}
     proj_id = df_summary.iloc[selected_rows[0]]['id']
     df_sel  = df_tasks[df_tasks['project_id_id']==proj_id].copy()
+    # status textual
     df_sel['status'] = df_sel.apply(
         lambda r: 'Atrasada' if r['is_delayed']
                   else ('Concluída' if not r['is_open'] else 'No Prazo'),
         axis=1
     )
-    fig  = px.pie(df_sel, names='status', title='Status das Tarefas')
+    # formata datas em DD/MM/YYYY usando date_deadline_dt para evitar bools
+    df_sel['create_date']   = pd.to_datetime(df_sel['create_date'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('—')
+    df_sel['date_deadline'] = pd.to_datetime(df_sel['date_deadline'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('—')
+
+    fig  = px.pie(df_sel, names='status', title='Status das Tarefas',
+                  color='status',
+                  color_discrete_map={
+                      'Concluída': '#636EFA',
+                      'No Prazo': '#00CC96',
+                      'Atrasada': '#FF0000'
+                  })
     recs = df_sel[['name','create_date','date_deadline','concluida','status']].to_dict('records')
     return recs, fig
 
