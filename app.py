@@ -1,223 +1,213 @@
 import dash
-from dash import dcc, html, dash_table, Input, Output
+from dash import dcc, html, Input, Output, callback_context
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import timedelta
 import odoo_client
 
-# 1) Carregar dados
-df_projects = odoo_client.get_projects()
-df_tasks    = odoo_client.get_tasks()
-
-today = datetime.now().date()
-
-# 2) Converter datas brutas
-df_tasks['date_end_dt']      = pd.to_datetime(df_tasks['date_end'], errors='coerce').dt.date
-_df_deadline = pd.to_datetime(df_tasks['date_deadline'], errors='coerce')
-df_tasks['date_deadline_dt'] = _df_deadline.dt.date
-
-# 3) IDs de project_id e parent_id
-df_tasks['project_id_id'] = df_tasks['project_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) else v)
-df_tasks['parent_id_id']  = df_tasks['parent_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
-
-# 4) Tarefas-pai somente
-df_tasks = df_tasks[df_tasks['parent_id_id'].isna()].copy()
-
-# 5) Estados
-df_tasks['is_open']   = df_tasks['state'].isin(['01_in_progress','02_changes_requested','03_approved'])
-df_tasks['concluida'] = df_tasks['state'].isin(['1_done','1_canceled']).map({True:'Sim',False:'Não'})
-
-# 6) Atrasadas
-df_tasks['is_delayed'] = df_tasks.apply(lambda r: r['is_open'] and pd.notna(r['date_deadline_dt']) and r['date_deadline_dt'] < today, axis=1)
-
-# 7) Contagem por projeto
-open_series    = df_tasks[df_tasks['is_open']].groupby('project_id_id').size()
-delayed_series = df_tasks[df_tasks['is_delayed']].groupby('project_id_id').size()
-df_projects['open_tasks']    = df_projects['id'].map(open_series).fillna(0).astype(int)
-df_projects['delayed_tasks'] = df_projects['id'].map(delayed_series).fillna(0).astype(int)
-
-# 8) Resumo
-df_summary = df_projects.rename(columns={'task_count':'total_tasks'})[['id','name','user_id','total_tasks','open_tasks','delayed_tasks']]
-
-# Brand colors
+# Constants de estilo
 PRIMARY = '#004aad'
 ACCENT  = '#ffc107'
 BG      = '#f9f9f9'
 FONT    = 'Helvetica, Arial, sans-serif'
 
-# 9) App layout
-app = dash.Dash(__name__)
-app.layout = html.Div(
-    style={'backgroundColor': BG, 'fontFamily': FONT, 'padding': '20px'},
-    children=[
-        # Header com logo
-        html.Div(
-            style={'display':'flex','alignItems':'center','marginBottom':'20px'},
-            children=[
-                html.Img(src='/assets/dac_logo.png', style={'height':'60px','marginRight':'15px'}),
-                html.H1('Dashboard DAC Engenharia', style={'color': PRIMARY, 'margin': 0})
-            ]
-        ),
-        # Tabs
-        dcc.Tabs(
-            id='tabs',
-            value='tab-summary',
-            children=[
-                dcc.Tab(
-                    label='Resumo',
-                    value='tab-summary',
-                    children=[
-                        html.Div(
-                            [
-                                html.H2('Resumo dos Departamentos', style={'color': PRIMARY}),
-                                dcc.Graph(id='projetos-grafico')
-                            ],
-                            style={'marginTop':'20px'}
-                        )
-                    ]
-                ),
-                dcc.Tab(
-                    label='Departamentos',
-                    value='tab-projects',
-                    children=[
-                        html.Div(
-                            [
-                                html.H3('Departamentos', style={'color': PRIMARY}),
-                                dash_table.DataTable(
-                                    id='projects-table',
-                                    columns=[
-                                        {'name':'Departamento','id':'name'},
-                                        {'name':'Gerente','id':'user_id'},
-                                        {'name':'Total','id':'total_tasks'},
-                                        {'name':'Aberto','id':'open_tasks'},
-                                        {'name':'Atrasadas','id':'delayed_tasks'}
-                                    ],
-                                    data=df_summary.to_dict('records'),
-                                    row_selectable='single',
-                                    filter_action='native',
-                                    sort_action='native',
-                                    style_table={'overflowX':'auto','backgroundColor':'white'},
-                                    style_header={'backgroundColor': PRIMARY,'color':'white'},
-                                    style_cell={'textAlign':'left','padding':'5px'}
-                                ),
-                                dcc.Graph(id='project-pie', style={'marginTop':'20px'})
-                            ]
-                        )
-                    ]
-                ),
-                dcc.Tab(
-                    label='Tarefas',
-                    value='tab-tasks',
-                    children=[
-                        html.Div(
-                            [
-                                html.H3('Tarefas em Andamento', style={'color': PRIMARY}),
-                                dcc.Dropdown(
-                                    id='tasks-project-dropdown',
-                                    options=[{'label': r['name'], 'value': r['id']} for r in df_summary.to_dict('records')],
-                                    placeholder='Selecione um projeto',
-                                    style={'marginBottom':'10px'}
-                                ),
-                                dcc.Graph(id='gantt-chart', style={'height':'1000px', 'overflowY':'scroll'}),
-                                dash_table.DataTable(
-                                    id='tasks-table',
-                                    columns=[
-                                        {'name':'Nome','id':'name'},
-                                        {'name':'Criada','id':'create_date'},
-                                        {'name':'Prazo','id':'date_deadline'},
-                                        {'name':'Status','id':'status'}
-                                    ],
-                                    data=[],
-                                    filter_action='native',
-                                    sort_action='native',
-                                    style_table={'overflowX':'auto','backgroundColor':'white'},
-                                    style_header={'backgroundColor': PRIMARY,'color':'white'},
-                                    style_cell={'textAlign':'left','padding':'5px'},
-                                    style_data_conditional=[
-                                        {'if':{'filter_query':'{status}="Atrasada"'},'backgroundColor':'#fdecea','color':'#a80000'}
-                                    ]
-                                )
-                            ]
-                        )
-                    ]
-                )
-            ]
-        )
-    ]
-)
+# Carrega e prepara dados
 
-# 10) Callbacks
-@app.callback(
-    Output('projetos-grafico','figure'),
-    Output('project-pie','figure'),
-    Input('projects-table','selected_rows'),
-    Input('projects-table','data')
-)
-def update_projects_graph(selected_rows, projects_data):
-    df = pd.DataFrame(projects_data)
-    if df.empty:
-        return {}, {}
-    fig = px.bar(
-        df, x='name', y=['total_tasks','open_tasks','delayed_tasks'], barmode='group',
-        labels={'name':'Departamento','value':'Quantidade','variable':'Tipo'}, title='',
-        color_discrete_map={'total_tasks':PRIMARY,'open_tasks':ACCENT,'delayed_tasks':'#d62828'}
+def load_and_prepare_data():
+    df_projects = odoo_client.get_projects()
+    df_tasks = odoo_client.get_tasks()
+
+    # Datas como Timestamps
+    df_tasks['date_deadline'] = pd.to_datetime(df_tasks['date_deadline'], errors='coerce')
+    df_tasks['create_date']   = pd.to_datetime(df_tasks['create_date'], errors='coerce')
+
+    # IDs relacionais
+    for col in ['project_id', 'parent_id']:
+        df_tasks[f"{col}_id"]   = df_tasks[col].apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
+        df_tasks[f"{col}_name"] = df_tasks[col].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and len(v)>1 else None)
+
+    # Dependências
+    def extract_ids(v):
+        if isinstance(v, (list, tuple)):
+            ids = []
+            for x in v:
+                if isinstance(x, (list, tuple)) and x:
+                    ids.append(x[0])
+                elif isinstance(x, int):
+                    ids.append(x)
+            return ids
+        return []
+
+    df_tasks['depend_on_ids_list'] = df_tasks['depend_on_ids'].apply(extract_ids)
+
+    # Estado e atraso
+    now = pd.Timestamp.now().normalize()
+    df_tasks['is_open'] = df_tasks['state'].isin(['01_in_progress','02_changes_requested','03_approved'])
+    df_tasks['is_delayed'] = df_tasks.apply(
+        lambda r: r['is_open'] and pd.notna(r['date_deadline']) and r['date_deadline'] < now,
+        axis=1
     )
-    fig.update_layout(plot_bgcolor='white', paper_bgcolor=BG, legend=dict(title='Legenda'), margin=dict(t=20))
-    for t in fig.data:
-        t.name = {'total_tasks':'Total','open_tasks':'Em Aberto','delayed_tasks':'Atrasadas'}.get(t.name)
-    pie = {}
-    if selected_rows:
-        proj = df.iloc[selected_rows[0]]
-        pie = px.pie(
-            df.iloc[selected_rows], names=['Total','Em Aberto','Atrasadas'], values=[proj.total_tasks, proj.open_tasks, proj.delayed_tasks],
-            color_discrete_map={'Total':PRIMARY,'Em Aberto':ACCENT,'Atrasadas':'#d62828'}
-        )
-        pie.update_traces(marker=dict(colors=[PRIMARY, ACCENT, '#d62828']))
-        pie.update_layout(plot_bgcolor='white', paper_bgcolor=BG, margin=dict(t=30))
-    return fig, pie
 
-@app.callback(
-    Output('tasks-table','data'),
-    Output('gantt-chart','figure'),
-    Input('tasks-project-dropdown','value')
-)
-def update_tasks(value):
-    if not value:
-        return [], {}
-    df_sel = df_tasks[(df_tasks['project_id_id']==value) & (df_tasks['is_open'])].copy()
-    df_sel['status'] = df_sel.apply(lambda r: 'Atrasada' if r['is_delayed'] else 'No Prazo', axis=1)
-    df_sel['create_date'] = pd.to_datetime(df_sel['create_date'], errors='coerce').dt.strftime('%d/%m/%Y')
-    df_sel['date_deadline'] = pd.to_datetime(df_sel['date_deadline'], errors='coerce').dt.strftime('%d/%m/%Y')
-    df_sel['start_dt'] = pd.to_datetime(df_sel['create_date'], dayfirst=True)
-    df_sel['finish_dt'] = df_sel.apply(lambda r: pd.to_datetime(today) if r['is_delayed'] else pd.to_datetime(r['date_deadline'], dayfirst=True), axis=1)
-    gantt = px.timeline(
-        df_sel, x_start='start_dt', x_end='finish_dt', y='name', color='status',
+    # Cálculo de datas de início
+    def recalc_starts(df):
+        df = df.copy()
+        task_map = {r['id']: r for _,r in df.iterrows()}
+        def find_start(tid, seen=None):
+            if seen is None: seen=set()
+            if tid in seen or tid not in task_map:
+                return pd.NaT
+            seen.add(tid)
+            task = task_map[tid]
+            deps = task['depend_on_ids_list']
+            if not deps:
+                return task['create_date']
+            latest=None
+            for d in deps:
+                dep=task_map.get(d)
+                if dep is None: continue
+                end=dep['date_deadline']
+                if pd.isna(end):
+                    st=find_start(d,seen.copy())
+                    if pd.notna(st): end=st+timedelta(days=7)
+                if pd.notna(end) and (latest is None or end>latest):
+                    latest=end
+            return (latest+timedelta(days=1)) if latest is not None else task['create_date']
+        df['calculated_start'] = df['id'].apply(find_start)
+        return df
+
+    df_tasks = recalc_starts(df_tasks)
+
+    # Resumo
+    summary = df_projects.copy()
+    oc = df_tasks[df_tasks['is_open']].groupby('project_id_id').size()
+    dc = df_tasks[df_tasks['is_delayed']].groupby('project_id_id').size()
+    summary['open_tasks']    = summary['id'].map(oc).fillna(0).astype(int)
+    summary['delayed_tasks'] = summary['id'].map(dc).fillna(0).astype(int)
+    summary['total_tasks']   = summary.get('task_count', 0)
+    return df_projects, df_tasks, summary
+
+# Globals
+df_projects, df_tasks, df_summary = load_and_prepare_data()
+now = pd.Timestamp.now().normalize()
+
+# Gantt generator
+def generate_gantt(df_sel):
+    fig = go.Figure()
+    if df_sel.empty:
+        return fig.update_layout(title="Nenhuma tarefa selecionada", plot_bgcolor='white', paper_bgcolor=BG)
+
+    df = df_sel.copy()
+    df['start'] = pd.to_datetime(df['calculated_start'].fillna(df['create_date']))
+    df['finish']= pd.to_datetime(df['date_deadline'])
+    df=df.dropna(subset=['start','finish'])
+    df['status']=df['is_delayed'].map({True:'Atrasada',False:'No Prazo'})
+
+    fig = px.timeline(
+        df, x_start='start', x_end='finish', y='name', color='status',
         color_discrete_map={'No Prazo':ACCENT,'Atrasada':'#d62828'}
     )
-    gantt.update_traces(marker=dict(line_color=PRIMARY, line_width=0.5))
-    gantt.update_layout(
-        title='Tarefas em Andamento',
-        xaxis_title='Prazo',
-        yaxis_title='Tarefa',
-        legend_title='Status',
-        xaxis_tickformat='%d/%m/%Y',
-        yaxis_tickformat='%d/%m/%Y'
+    fig.update_traces(marker_line_color=PRIMARY)
+    fig.update_layout(
+        title='Cronograma de Tarefas', yaxis={'autorange':'reversed'},
+        plot_bgcolor='white', paper_bgcolor=BG,
+        margin=dict(t=50,b=20,l=20,r=20), height=max(300,len(df)*40),
+        legend_title_text='Status', xaxis_title='Data'
     )
-    
-    gantt.update_layout(plot_bgcolor='white', paper_bgcolor=BG, margin=dict(t=30))
-    gantt.update_yaxes(autorange='reversed')
-    gantt.add_trace(
-        go.Scatter(
-            x=pd.to_datetime(df_sel['date_deadline'], dayfirst=True),
-            y=df_sel['name'], mode='markers', marker_symbol='line-ns-open',
-            marker_line_width=2, marker_size=12, marker_color='black', showlegend=False
-        )
-    )
-    recs = df_sel[['name','create_date','date_deadline','status']].to_dict('records')
-    return recs, gantt
 
-# 11) Run
+    # Dependências
+    id_map={r['id']:r for _,r in df.iterrows()}
+    for _,row in df.iterrows():
+        for d in row['depend_on_ids_list']:
+            src = id_map.get(d)
+            if src is None:
+                continue
+            x0, y0 = src['finish'], src['name']
+            x1, y1 = row['start'], row['name']
+            fig.add_shape(
+                type='line', x0=x0, y0=y0, x1=x1, y1=y1,
+                line=dict(color='#666666', width=2, dash='dot'), layer='below'
+            )
+            fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, showarrow=True, arrowhead=3, arrowsize=1)
+
+    # Linha 'Hoje' como shape + annotation
+    fig.add_shape(
+        type='line', x0=now, x1=now,
+        y0=0, y1=1, xref='x', yref='paper',
+        line_dash='dash', line_color='green'
+    )
+    fig.add_annotation(
+        x=now, y=1, xref='x', yref='paper',
+        text='Hoje', showarrow=False, yanchor='bottom', align='right'
+    )
+
+    return fig
+
+# App layout
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+proj_opts=[{'label':n,'value':i} for i,n in zip(df_projects['id'],df_projects['name'])]
+app.layout=html.Div(style={'fontFamily':FONT,'bg':BG,'padding':20},children=[
+    html.H1('Dashboard DAC Engenharia',style={'color':PRIMARY,'textAlign':'center'}),
+    dcc.Tabs(id='tabs',value='tab-summary',children=[
+        dcc.Tab(label='Resumo',value='tab-summary',children=html.Div(
+            dcc.Graph(figure=px.bar(
+                df_summary,x='name',y=['total_tasks','open_tasks','delayed_tasks'],barmode='group',
+                labels={'name':'Projeto','value':'Número de Tarefas','variable':'Tipo'},
+                color_discrete_map={'total_tasks':PRIMARY,'open_tasks':ACCENT,'delayed_tasks':'#d62828'}
+            ).update_layout(plot_bgcolor='white',paper_bgcolor=BG,margin=dict(t=30),
+                            legend_title_text='Tipo de Tarefa',xaxis_title='Projeto',yaxis_title='Número de Tarefas')
+            )
+        ,style={'padding':20})),
+        dcc.Tab(label='Cronograma',value='tab-gantt',children=html.Div([
+            html.Div(style={'display':'flex','marginBottom':'20px'},children=[
+                html.Div([html.Label('Projeto:',style={'fontWeight':'bold'}),dcc.Dropdown(id='project-dropdown',options=proj_opts,placeholder='Selecione um projeto')],style={'flex':1,'paddingRight':'10px'}),
+                html.Div([html.Label('Tarefa Principal:',style={'fontWeight':'bold'}),dcc.Dropdown(id='parent-task-dropdown',placeholder='Selecione projeto primeiro')],style={'flex':1,'paddingRight':'10px'}),
+                html.Div([html.Label('Subtarefa:',style={'fontWeight':'bold'}),dcc.Dropdown(id='child-task-dropdown',placeholder='Selecione tarefa principal primeiro')],style={'flex':1})
+            ]),
+            html.H3('Tarefas do Projeto',style={'color':PRIMARY}),dcc.Graph(id='project-gantt'),
+            html.H3('Subtarefas',style={'color':PRIMARY}),dcc.Graph(id='subtasks-gantt')
+        ],style={'padding':20}))
+    ])
+])
+
+# Callbacks
+@app.callback(Output('parent-task-dropdown','options'),Input('project-dropdown','value'))
+def set_parents(pid):
+    if not pid: return []
+    dfp=df_tasks[(df_tasks['project_id_id']==pid)&(df_tasks['parent_id_id'].isna())]
+    return [{'label':r['name'],'value':r['id']}for _,r in dfp.iterrows()]
+
+@app.callback(Output('child-task-dropdown','options'),Input('parent-task-dropdown','value'))
+def set_children(p_id):
+    if not p_id: return []
+    dfc=df_tasks[df_tasks['parent_id_id']==p_id]
+    return [{'label':r['name'],'value':r['id']}for _,r in dfc.iterrows()]
+
+@app.callback(Output('project-gantt','figure'),[Input('project-dropdown','value'),Input('parent-task-dropdown','value')])
+def update_proj(pid,pid_p):
+    trg=callback_context.triggered[0]['prop_id']
+    if 'project-dropdown' in trg and pid:
+        sel=df_tasks[(df_tasks['project_id_id']==pid)&(df_tasks['parent_id_id'].isna())]
+        return generate_gantt(sel)
+    if 'parent-task-dropdown' in trg and pid_p:
+        m=df_tasks[df_tasks['id']==pid_p]
+        dps=df_tasks[df_tasks['id'].isin(m.iloc[0]['depend_on_ids_list'])]
+        dnds=df_tasks[df_tasks['depend_on_ids_list'].apply(lambda lst:pid_p in lst)]
+        return generate_gantt(pd.concat([m,dps,dnds]))
+    return go.Figure().update_layout(title='Selecione um projeto')
+
+@app.callback(Output('subtasks-gantt','figure'),[Input('parent-task-dropdown','value'),Input('child-task-dropdown','value')])
+def update_sub(p_id,c_id):
+    trg=callback_context.triggered[0]['prop_id']
+    if 'parent-task-dropdown' in trg and p_id:
+        sel = df_tasks[df_tasks['parent_id_id']==p_id]
+        return generate_gantt(sel)
+    if 'child-task-dropdown' in trg and c_id:
+        s = df_tasks[df_tasks['id']==c_id]
+        dp = df_tasks[df_tasks['id'].isin(s.iloc[0]['depend_on_ids_list'])]
+        dn = df_tasks[df_tasks['depend_on_ids_list'].apply(lambda lst: c_id in lst)]
+        return generate_gantt(pd.concat([s, dp, dn]))
+    return go.Figure().update_layout(title='Selecione uma subtarefa')
+
 if __name__=='__main__':
-    app.run(host='0.0.0.0', port=8050, debug=True)
-
+    app.run(debug=True)
