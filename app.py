@@ -244,4 +244,4 @@ def update_task_table(proj_id):
     return df[['name','status','deadline']].to_dict('records')
 
 if __name__=='__main__':
-    app.run(host='0.0.0.0', port=8050, debug=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=8050)
