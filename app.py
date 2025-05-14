@@ -153,9 +153,9 @@ app.layout = html.Div(
                 html.Div(
                     style={'display':'flex','marginBottom':'20px'},
                     children=[
-                        html.Div([html.Label('Projeto:', style={'fontWeight':'bold'}), dcc.Dropdown(id='project-dropdown', options=opts, placeholder='Selecione projeto')], style={'flex':1,'paddingRight':'10px'}),
-                        html.Div([html.Label('Tarefa Principal:', style={'fontWeight':'bold'}), dcc.Dropdown(id='parent-task-dropdown', placeholder='Selecione projeto primeiro')], style={'flex':1,'paddingRight':'10px'}),
-                        html.Div([html.Label('Subtarefa:', style={'fontWeight':'bold'}), dcc.Dropdown(id='child-task-dropdown', placeholder='Selecione tarefa primeiro')], style={'flex':1})
+                        html.Div([html.Label('Departamento:', style={'fontWeight':'bold'}), dcc.Dropdown(id='project-dropdown', options=opts, placeholder='Selecione projeto')], style={'flex':1,'paddingRight':'10px'}),
+                        html.Div([html.Label('Projeto:', style={'fontWeight':'bold'}), dcc.Dropdown(id='parent-task-dropdown', placeholder='Selecione projeto primeiro')], style={'flex':1,'paddingRight':'10px'}),
+                        html.Div([html.Label('Tarefa:', style={'fontWeight':'bold'}), dcc.Dropdown(id='child-task-dropdown', placeholder='Selecione tarefa primeiro')], style={'flex':1})
                     ]
                 ),
                 html.H3('Tarefas do Projeto', style={'color':PRIMARY}), dcc.Graph(id='project-gantt'),
