@@ -19,7 +19,7 @@ odoo.login(DB, USER, PASS)
 # Buscar projetos ativos
 projects = odoo.env["project.project"].search_read(
     [("active", "=", True)],
-    ["id", "name", "date_start", "date", "user_id", "task_count", "open_task_count"]
+    ["id", "name", "date_start", "date", "user_id", "task_count", "open_task_count", "tag_ids"]
 )
 df_projects = pd.DataFrame(projects)
 
@@ -29,7 +29,22 @@ if "user_id" in df_projects.columns:
         lambda x: x[1] if isinstance(x, list) else x
     )
 
-# Buscar tarefas dos projetos ativos com informações adicionais
+# Buscar todas as tags para mapear ID → Nome
+tag_records = odoo.env['project.tags'].search_read(
+    [], ['id', 'name']
+)
+df_tags = pd.DataFrame(tag_records)
+tag_map = dict(zip(df_tags['id'], df_tags['name']))
+
+# Mapear nome das tags nos projetos (primeira tag como departamento)
+def map_department(tag_ids):
+    if isinstance(tag_ids, (list, tuple)) and tag_ids:
+        return tag_map.get(tag_ids[0], 'Sem Departamento')
+    return 'Sem Departamento'
+
+df_projects['department'] = df_projects['tag_ids'].apply(map_department)
+
+# Buscar tarefas dos projetos ativos
 tasks = odoo.env["project.task"].search_read(
     [("project_id.active", "=", True)],
     [
@@ -46,6 +61,7 @@ if "partner_id" in df_tasks.columns:
     )
 
 # Extrair projeto
+
 def _extract_id_name(field_value):
     if isinstance(field_value, list) and len(field_value) >= 2:
         return field_value[0], field_value[1]
@@ -64,7 +80,7 @@ if "stage_id" in df_tasks.columns:
 if "depend_on_ids" in df_tasks.columns:
     df_tasks["depend_on_ids_list"] = df_tasks["depend_on_ids"].apply(
         lambda v: [x[0] if isinstance(x, (list, tuple)) else x for x in v]
-                  if isinstance(v, (list, tuple)) else []
+        if isinstance(v, (list, tuple)) else []
     )
 else:
     df_tasks["depend_on_ids_list"] = [[] for _ in range(len(df_tasks))]
