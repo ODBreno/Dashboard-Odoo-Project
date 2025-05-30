@@ -1,18 +1,19 @@
 import dash
-from dash import dcc, html, Input, Output, dash_table
+from dash import dcc, html, Input, Output, dash_table, State
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import timedelta
-import odoo_client
+import odoo_client # Assume o odoo_client.py modificado anteriormente
 import io
 
 # === Constantes de estilo ===
 PRIMARY = '#004aad'
-ACCENT = '#ffc107'
+ACCENT = '#FFFF00'
 DELAYED = '#d62828'
+WARNING = '#f57c00'
 DONE = 'green'
-PLANNED = 'gray'
+PLANNED = 'gray' # Cinza para Planejado
 BG = '#f9f9f9'
 FONT = 'Helvetica, Arial, sans-serif'
 LIGHT_BLUE = '#add8e6'
@@ -22,693 +23,614 @@ def load_and_prepare_data():
     df_projects = odoo_client.get_projects()
     df_tasks = odoo_client.get_tasks()
 
-    df_tasks['date_deadline'] = pd.to_datetime(df_tasks['date_deadline'], errors='coerce')
-    df_tasks['create_date'] = pd.to_datetime(df_tasks['create_date'], errors='coerce')
+    if df_projects.empty and df_tasks.empty:
+        print("ATENÇÃO: Não foi possível carregar dados de projetos nem de tarefas do Odoo.")
+        cols_projects = ['id', 'name', 'date_start', 'date', 'user_id', 'task_count', 'open_task_count', 'tag_ids', 'department']
+        cols_tasks = ['id', 'name', 'create_date', 'date_deadline', 'date_end', 'partner_id', 'project_id', 'stage_id', 
+                      'state', 'active', 'parent_id', 'depend_on_ids', 'project_id_id', 'project_id_name', 
+                      'stage_id_id', 'stage_id_name', 'depend_on_ids_list']
+        df_projects = pd.DataFrame(columns=cols_projects)
+        df_tasks = pd.DataFrame(columns=cols_tasks)
+        for col in ['date_start', 'date']:
+            if col in df_projects.columns: df_projects[col] = pd.to_datetime(df_projects[col], errors='coerce')
+        for col in ['create_date', 'date_deadline', 'date_end']:
+            if col in df_tasks.columns: df_tasks[col] = pd.to_datetime(df_tasks[col], errors='coerce')
 
-    def safe_id(v):
-        if isinstance(v, (list, tuple)) and v:
-            return v[0]
-        if isinstance(v, int):
-            return v
-        return None
+    if not df_tasks.empty:
+        if 'date_deadline' in df_tasks.columns:
+            df_tasks['date_deadline'] = pd.to_datetime(df_tasks['date_deadline'], errors='coerce')
+        else:
+            df_tasks['date_deadline'] = pd.NaT
+        if 'create_date' in df_tasks.columns:
+            df_tasks['create_date'] = pd.to_datetime(df_tasks['create_date'], errors='coerce')
+        else:
+            df_tasks['create_date'] = pd.NaT
 
-    def safe_name(v):
-        if isinstance(v, (list, tuple)) and len(v) > 1:
-            return v[1]
-        return None
+        def safe_id_local(v):
+            if isinstance(v, (list, tuple)) and v: return v[0]
+            if isinstance(v, int): return v
+            return None
 
-    for col in ['project_id', 'parent_id']:
-        df_tasks[f"{col}_id"] = df_tasks[col].apply(safe_id)
-        df_tasks[f"{col}_name"] = df_tasks[col].apply(safe_name)
+        if 'parent_id' in df_tasks.columns:
+            df_tasks['parent_id_id'] = df_tasks['parent_id'].apply(safe_id_local)
+        else:
+            df_tasks['parent_id_id'] = None
 
-    df_tasks['depend_on_ids_list'] = df_tasks['depend_on_ids'].apply(
-        lambda v: [x[0] if isinstance(x, (list, tuple)) else x for x in v]
-                     if isinstance(v, (list, tuple)) else []
-    )
+        if 'depend_on_ids_list' not in df_tasks.columns:
+            df_tasks['depend_on_ids_list'] = [[] for _ in range(len(df_tasks))]
 
-    hoje = pd.Timestamp.now().normalize()
-    df_tasks['is_open'] = df_tasks['state'].isin([
-        '01_in_progress','02_changes_requested','03_approved'
-    ])
-    df_tasks['is_delayed'] = df_tasks.apply(
-        lambda r: r['is_open'] and pd.notna(r['date_deadline']) \
-                     and r['date_deadline'] < hoje,
-        axis=1
-    )
+        hoje = pd.Timestamp.now().normalize()
+        if 'state' not in df_tasks.columns:
+            df_tasks['state'] = None
+            df_tasks['is_open'] = False
+        else:
+            open_task_states = ['01_in_progress','02_changes_requested','03_approved']
+            df_tasks['is_open'] = df_tasks['state'].isin(open_task_states)
 
-    def classify(r):
-        if r['state'] in ['04_done','done','1_done']:
-            return 'Concluída'
-        if r['is_delayed']:
-            return 'Atrasada'
-        if r['is_open']:
-            return 'Em Andamento'
-        return 'Planejada'
+        if 'date_deadline' not in df_tasks.columns:
+            df_tasks['is_delayed'] = False
+        else:
+            df_tasks['is_delayed'] = df_tasks.apply(
+                lambda r: r.get('is_open', False) and pd.notna(r.get('date_deadline')) and r['date_deadline'] < hoje,
+                axis=1
+            )
 
-    df_tasks['status_cat'] = df_tasks.apply(classify, axis=1)
+        def classify_task_status(r):
+            state_val = r.get('state')
+            is_delayed_val = r.get('is_delayed', False)
+            is_open_val = r.get('is_open', False)
+            if state_val in ['04_done', 'done', '1_done', 'cancel']: return 'Concluída'
+            if is_delayed_val: return 'Atrasada'
+            if is_open_val: return 'Em Andamento'
+            if (pd.notna(r.get('date_deadline')) and r['date_deadline'] >= hoje and not is_open_val) or \
+               (pd.isna(r.get('date_deadline')) and not is_open_val): return 'Planejada'
+            return 'Planejada'
+        df_tasks['status_cat'] = df_tasks.apply(classify_task_status, axis=1)
 
-    def recalc(df):
-        df2 = df.set_index('id').copy()
-        def find_start(tid, seen=None):
-            if seen is None:
-                seen = set()
-            if tid in seen or tid not in df2.index:
-                return pd.NaT
-            seen.add(tid)
-            rec = df2.loc[tid]
-            deps = rec['depend_on_ids_list']
-            if not deps:
-                return rec['create_date']
-            latest = None
-            for d in deps:
-                if d not in df2.index:
-                    continue
-                dep = df2.loc[d]
-                end = dep['date_deadline']
-                if pd.isna(end):
-                    start_dep = find_start(d, seen.copy())
-                    if pd.notna(start_dep):
-                        end = start_dep + timedelta(days=7)
-                if pd.notna(end) and (latest is None or end > latest):
-                    latest = end
-            return (latest + timedelta(days=1)) \
-                   if latest is not None else rec['create_date']
-        df2['calculated_start'] = [find_start(i) for i in df2.index]
-        return df2.reset_index()
+        def recalc(df):
+            if 'id' not in df.columns or df.empty:
+                df['calculated_start'] = pd.NaT
+                return df
+            df_copy = df.set_index('id').copy()
+            def find_start(task_id, seen_tasks=None):
+                if seen_tasks is None: seen_tasks = set()
+                if task_id in seen_tasks or task_id not in df_copy.index: return pd.NaT
+                seen_tasks.add(task_id)
+                current_task_record = df_copy.loc[task_id]
+                dependencies = current_task_record.get('depend_on_ids_list', [])
+                if not dependencies: return current_task_record.get('create_date')
+                latest_dependency_end_date = pd.NaT
+                for dep_id in dependencies:
+                    if dep_id not in df_copy.index: continue
+                    dependency_record = df_copy.loc[dep_id]
+                    dependency_deadline = dependency_record.get('date_deadline')
+                    if pd.isna(dependency_deadline):
+                        dependency_start_date = find_start(dep_id, seen_tasks.copy())
+                        if pd.notna(dependency_start_date):
+                            duration_days = current_task_record.get('duration_expected_days', 7) 
+                            dependency_deadline = dependency_start_date + timedelta(days=duration_days)
+                    if pd.notna(dependency_deadline) and \
+                       (pd.isna(latest_dependency_end_date) or dependency_deadline > latest_dependency_end_date):
+                        latest_dependency_end_date = dependency_deadline
+                return (latest_dependency_end_date + timedelta(days=1)) if pd.notna(latest_dependency_end_date) else current_task_record.get('create_date')
+            if not df_copy.empty: df_copy['calculated_start'] = [find_start(i) for i in df_copy.index]
+            else:
+                if 'calculated_start' not in df.columns: df['calculated_start'] = pd.NaT
+                return df
+            return df_copy.reset_index()
+        df_tasks = recalc(df_tasks)
 
-    df_tasks = recalc(df_tasks)
+    if not df_projects.empty and not df_tasks.empty:
+        if 'project_id_id' in df_tasks.columns and 'id' in df_projects.columns and \
+           'department' in df_projects.columns and 'name' in df_projects.columns:
+            df_project_info = df_projects[['id', 'department', 'name']].rename(columns={'name': 'name_project_temp'})
+            df_tasks = pd.merge(df_tasks, df_project_info, left_on='project_id_id', right_on='id', how='left', suffixes=('', '_from_proj'))
+            if 'department_from_proj' in df_tasks.columns:
+                df_tasks['department'] = df_tasks['department_from_proj'].fillna('Sem Departamento')
+                df_tasks.drop(columns=['department_from_proj'], inplace=True)
+            elif 'department' not in df_tasks.columns: df_tasks['department'] = 'Sem Departamento'
+            if 'name_project_temp' in df_tasks.columns:
+                df_tasks['name_project'] = df_tasks['name_project_temp'].fillna('Projeto não especificado')
+                df_tasks.drop(columns=['name_project_temp'], inplace=True)
+            elif 'name_project' not in df_tasks.columns: df_tasks['name_project'] = 'Projeto não especificado'
+            if 'id_from_proj' in df_tasks.columns: df_tasks.drop(columns=['id_from_proj'], inplace=True)
+        else:
+            if 'department' not in df_tasks.columns: df_tasks['department'] = 'Sem Departamento'
+            if 'name_project' not in df_tasks.columns: df_tasks['name_project'] = 'Projeto não especificado'
+    elif not df_tasks.empty:
+        if 'department' not in df_tasks.columns: df_tasks['department'] = 'Sem Departamento'
+        if 'name_project' not in df_tasks.columns: df_tasks['name_project'] = 'Projeto não especificado'
 
-    # Adiciona o nome do departamento e do projeto à tarefa
-    df_tasks = pd.merge(df_tasks, df_projects[['id', 'department', 'name']],
-                        left_on='project_id_id', right_on='id',
-                        suffixes=('', '_proj_name'), how='left')
-    df_tasks.rename(columns={'department_proj_name': 'department', 'name_proj_name': 'name_project'}, inplace=True)
-    
-    task_names = df_tasks.set_index('id')['name'].to_dict()
-    df_tasks['depend_on_names'] = df_tasks['depend_on_ids_list'].apply(
-        lambda dep_ids: [task_names.get(d, f"ID:{d}") for d in dep_ids]
-    )
+    task_names = {}
+    if not df_tasks.empty and 'id' in df_tasks.columns and 'name' in df_tasks.columns:
+        task_names = df_tasks.set_index('id')['name'].to_dict()
+
+    if not df_tasks.empty and 'depend_on_ids_list' in df_tasks.columns:
+        df_tasks['depend_on_names'] = df_tasks['depend_on_ids_list'].apply(
+            lambda dep_ids_list: [task_names.get(d_id, f"ID:{d_id}") for d_id in dep_ids_list if isinstance(dep_ids_list, list)] if isinstance(dep_ids_list, list) else []
+        )
+    elif not df_tasks.empty:
+        df_tasks['depend_on_names'] = [[] for _ in range(len(df_tasks))]
 
     return df_projects.to_json(date_format='iso', orient='split'), \
            df_tasks.to_json(date_format='iso', orient='split')
 
-def compute_depths(df_indexed):
-    depth = {}
-    def get_depth(tid):
-        pid = df_indexed.at[tid, 'parent_id_id']
-        if pd.isna(pid) or pid not in df_indexed.index:
-            return 0
-        if tid in depth:
-            return depth[tid]
-        d = 1 + get_depth(pid)
-        depth[tid] = d
-        return d
-    for tid in df_indexed.index:
-        get_depth(tid)
-    return pd.Series(depth)
-
-# --- Gantt por projeto ---
-def generate_full_gantt(df_sel, pid, all_projects):
-    if df_sel.empty:
-        fig = go.Figure()
-        fig.update_layout(
-            title='Nenhuma tarefa',
-            plot_bgcolor='white',
-            paper_bgcolor=BG
-        )
-        return fig
-
-    df = df_sel.copy()
+def get_project_overall_status(project_row_input, project_tasks_df_input, project_calculated_end_date=None):
     hoje = pd.Timestamp.now().normalize()
-    df['start'] = pd.to_datetime(df['calculated_start'])
-    df['deadline'] = pd.to_datetime(df['date_deadline'])
-    df['end'] = df.apply(
-        lambda r: max(r['deadline'], hoje) if (
-            r['status_cat']=='Em Andamento' and pd.notna(r['deadline'])
-        ) else (
-            r['deadline'] if pd.notna(r['deadline']) else hoje
-        ),
-        axis=1
-    ).fillna(df['start'] + timedelta(days=1))
+    project_date_start_odoo = pd.to_datetime(project_row_input.get('date_start'), errors='coerce')
+    project_date_end_odoo = pd.to_datetime(project_row_input.get('date'), errors='coerce')
+    effective_project_end_date = project_calculated_end_date
+    if pd.isna(effective_project_end_date): effective_project_end_date = project_date_end_odoo
 
-    proj = all_projects.loc[all_projects['id']==pid].iloc[0]
-    ds = proj.get('date_start', None)
-    de = proj.get('date_end', None)
-    p_start = pd.to_datetime(ds) if pd.notna(ds) and not isinstance(ds, bool) \
-              else df['start'].min() if not df.empty else hoje
-    p_end = pd.to_datetime(de) if pd.notna(de) and not isinstance(de, bool) \
-              else df['end'].max() if not df.empty else hoje + timedelta(days=1)
+    has_tasks = not project_tasks_df_input.empty
+    project_has_any_delayed_task = False
+    project_has_any_active_task = False # Tarefas 'Em Andamento', 'Atrasada', 'Em Risco'
+    project_all_tasks_are_done = True    # Se não tem tarefas, ou todas são 'Concluída'
+    project_only_has_planned_tasks = False # Se tem tarefas, e todas são 'Planejada'
+
+    if has_tasks:
+        if 'is_delayed' in project_tasks_df_input.columns:
+            project_has_any_delayed_task = project_tasks_df_input['is_delayed'].any()
+        
+        if 'status_cat' in project_tasks_df_input.columns:
+            task_statuses = project_tasks_df_input['status_cat']
+            active_statuses = ['Em Andamento', 'Atrasada', 'Em Risco']
+            project_has_any_active_task = task_statuses.isin(active_statuses).any()
+            
+            # Verifica se todas as tarefas são 'Concluída' (nenhuma ativa ou planejada)
+            project_all_tasks_are_done = not task_statuses.isin(active_statuses + ['Planejada']).any()
+
+            # Verifica se SÓ tem tarefas 'Planejada'
+            if not project_has_any_active_task and not project_all_tasks_are_done:
+                # Isso significa que só podem ser 'Planejada' se não for vazia a lista de status
+                project_only_has_planned_tasks = task_statuses.isin(['Planejada']).all() and not task_statuses.isin(active_statuses + ['Concluída']).any()
+        else: # Fallback se status_cat não estiver disponível
+            project_all_tasks_are_done = False # Não se pode assumir
+            if 'is_open' in project_tasks_df_input.columns:
+                 project_has_any_active_task = project_tasks_df_input['is_open'].any() # Aproximação
+    
+    # Ordem de prioridade para status do projeto:
+    # 1. Atrasada (Vermelho)
+    has_pending_work = project_has_any_active_task or (project_only_has_planned_tasks and has_tasks)
+    if pd.notna(effective_project_end_date) and effective_project_end_date < hoje and has_pending_work:
+        return 'Atrasada'
+
+    # 2. Em Risco (Laranja)
+    if project_has_any_delayed_task:
+        return 'Em Risco'
+
+    # 3. Concluída (Verde)
+    if project_all_tasks_are_done: # Cobre o caso de não ter tarefas também.
+        return 'Concluída'
+        
+    # 4. Planejado (Cinza) - Condição específica do usuário
+    # Se o projeto não tem tarefas OU (tem tarefas E todas são 'Planejada'),
+    # E NÃO se enquadrou em Atrasado, Em Risco, Concluído.
+    if (not has_tasks) or (has_tasks and project_only_has_planned_tasks):
+        return 'Planejada'
+
+    # 5. Em Andamento (Amarelo)
+    if project_has_any_active_task: # Se tem tarefas ativas (Em Andamento, Atrasada já foi pego por Em Risco)
+        return 'Em Andamento'
+    
+    # Se chegou aqui, pode ser um projeto com data de início passada mas sem tarefas ativas (ex: só planejadas, já coberto acima)
+    # ou tarefas planejadas e data de início futura.
+    if pd.notna(project_date_start_odoo) and project_date_start_odoo > hoje: # Data de início futura
+        return 'Planejada' # Mesmo que tenha tarefas (que seriam Planejadas), o projeto em si é Planejado
+    
+    # Se a data de início já passou, e não se encaixou em nada acima (ex: tem tarefas mas o status não é claro)
+    # Default para 'Em Andamento' se o projeto já deveria ter começado.
+    if pd.notna(project_date_start_odoo) and project_date_start_odoo <= hoje:
+        return 'Em Andamento'
+
+    return 'Planejada' # Default final
+
+
+def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
+    hoje = pd.Timestamp.now().normalize()
+    if pid not in all_projects_df['id'].values:
+        fig = go.Figure().update_layout(title=f"Projeto com ID {pid} não encontrado.", plot_bgcolor='white', paper_bgcolor=BG)
+        return fig
+    project_details_row = all_projects_df.loc[all_projects_df['id'] == pid].iloc[0]
+    df_tasks_for_gantt = df_sel_tasks.copy()
+
+    for col in ['calculated_start', 'date_deadline', 'status_cat', 'depend_on_ids_list', 'id', 'name', 'parent_id_id', 'project_id_id']:
+        if col not in df_tasks_for_gantt.columns:
+            if col.endswith('_id') or col == 'id': df_tasks_for_gantt[col] = None
+            elif col == 'depend_on_ids_list': df_tasks_for_gantt[col] = [[] for _ in range(len(df_tasks_for_gantt))]
+            elif col.startswith('date') or col == 'calculated_start': df_tasks_for_gantt[col] = pd.NaT
+            else: df_tasks_for_gantt[col] = 'N/A'
+    
+    df_tasks_for_gantt['start'] = pd.to_datetime(df_tasks_for_gantt['calculated_start'], errors='coerce')
+    df_tasks_for_gantt['deadline'] = pd.to_datetime(df_tasks_for_gantt['date_deadline'], errors='coerce')
+    df_tasks_for_gantt['end'] = df_tasks_for_gantt.apply(
+        lambda r: max(r['deadline'], hoje) if (r.get('status_cat')=='Em Andamento' and pd.notna(r.get('deadline')))
+        else (r.get('deadline') if pd.notna(r.get('deadline')) 
+        else (r.get('start') + timedelta(days=1) if pd.notna(r.get('start')) else hoje + timedelta(days=1))),
+        axis=1
+    ).fillna(df_tasks_for_gantt['start'] + timedelta(days=1) if 'start' in df_tasks_for_gantt.columns and not df_tasks_for_gantt.empty and pd.notna(df_tasks_for_gantt['start'].iloc[0] if not df_tasks_for_gantt['start'].empty else pd.NaT) else hoje + timedelta(days=1) )
+
+    p_start_odoo = pd.to_datetime(project_details_row.get('date_start', None), errors='coerce')
+    p_start_from_tasks = pd.NaT
+    if not df_tasks_for_gantt.empty and 'start' in df_tasks_for_gantt.columns and df_tasks_for_gantt['start'].notna().any():
+        p_start_from_tasks = df_tasks_for_gantt['start'].min()
+    if pd.notna(p_start_odoo): p_start = p_start_odoo
+    elif pd.notna(p_start_from_tasks): p_start = p_start_from_tasks
+    else: p_start = hoje
+
+    p_end_odoo = pd.to_datetime(project_details_row.get('date', None), errors='coerce')
+    p_end_from_tasks = pd.NaT
+    if not df_tasks_for_gantt.empty and 'deadline' in df_tasks_for_gantt.columns and df_tasks_for_gantt['deadline'].notna().any():
+        p_end_from_tasks = df_tasks_for_gantt['deadline'].max()
+    if pd.notna(p_end_odoo): p_end = p_end_odoo
+    elif pd.notna(p_end_from_tasks): p_end = p_end_from_tasks
+    else: p_end = p_start + timedelta(days=1)
+    if pd.notna(p_start) and pd.notna(p_end) and p_end < p_start: p_end = p_start + timedelta(days=1)
 
     project_bar = pd.DataFrame([{
-        'id': pid,
-        'display_name': proj['name'],
-        'start': p_start,
-        'end': p_end,
-        'status_cat': 'Projeto',
-        'depend_on_ids_list': []
+        'id': pid, 
+        'display_name': project_details_row.get('name', f"Projeto ID: {pid}"),
+        'start': p_start, 'end': p_end,
+        'status_cat': 'Projeto', 
+        'depend_on_ids_list': [], 'project_id_id': pid 
     }])
+    full_df_for_gantt = project_bar.assign(__order=-1)
 
-    mask_no_deps = df['depend_on_ids_list'].apply(
-        lambda l: isinstance(l, list) and len(l) == 0
-    )
-    df.loc[mask_no_deps, 'start'] = p_start
-
-
-    df_idx = df.set_index('id')
-    df['depth'] = df['id'].map(compute_depths(df_idx)).fillna(0).astype(int)
-    df['display_name'] = df['depth'].apply(
-        lambda d: '   '*d
-    ) + df['name']
-
-    tree = {tid: [] for tid in df['id']}
-    for _, r in df.iterrows():
-        pid_p = r['parent_id_id']
-        if pd.notna(pid_p) and pid_p in tree:
-            tree[pid_p].append(r['id'])
-
-    order = []
-    def trav(tid):
-        order.append(tid)
-        for ch in sorted(
-            tree.get(tid, []),
-            key=lambda i: df_idx.at[i, 'start']
-        ):
-            trav(ch)
-
-    all_children = set()
-    for children_list in tree.values():
-        all_children.update(children_list)
-
-    roots = [
-        i for i in tree.keys()
-        if i not in all_children and df_idx.at[i, 'project_id_id'] == pid
-    ]
-    roots = sorted(roots, key=lambda i: df_idx.at[i, 'start'])
-    for rt in roots:
-        trav(rt)
-
-    df['__order'] = df['id'].apply(
-        lambda i: order.index(i) if i in order else float('inf')
-    )
-    df = df[df['__order'] != float('inf')]
-
-
-    full = pd.concat([
-        project_bar.assign(__order=-1), df
-    ], ignore_index=True).sort_values('__order')
+    if not df_tasks_for_gantt.empty:
+        mask_no_deps = df_tasks_for_gantt['depend_on_ids_list'].apply(lambda l: isinstance(l, list) and len(l) == 0)
+        if pd.notna(p_start): df_tasks_for_gantt.loc[mask_no_deps, 'start'] = p_start
+        df_idx_gantt = df_tasks_for_gantt.set_index('id')
+        if not df_idx_gantt.empty:
+            df_tasks_for_gantt['depth'] = df_tasks_for_gantt['id'].map(compute_depths(df_idx_gantt)).fillna(0).astype(int)
+            df_tasks_for_gantt['display_name'] = df_tasks_for_gantt['depth'].apply(lambda d: '   '*d) + df_tasks_for_gantt['name']
+        else:
+            df_tasks_for_gantt['depth'] = 0
+            df_tasks_for_gantt['display_name'] = df_tasks_for_gantt['name'] if 'name' in df_tasks_for_gantt else "Tarefa sem nome"
+        tree_gantt = {}
+        if 'id' in df_tasks_for_gantt.columns:
+            tree_gantt = {tid: [] for tid in df_tasks_for_gantt['id']}
+            if not df_idx_gantt.empty and 'parent_id_id' in df_idx_gantt.columns:
+                for task_id, task_row in df_idx_gantt.iterrows():
+                    parent_id = task_row.get('parent_id_id')
+                    if pd.notna(parent_id) and parent_id in tree_gantt:
+                        tree_gantt[parent_id].append(task_id)
+        order_gantt = []
+        def trav_gantt(tid):
+            order_gantt.append(tid)
+            children_to_sort = tree_gantt.get(tid, [])
+            if not df_idx_gantt.empty and 'start' in df_idx_gantt.columns:
+                children = sorted(children_to_sort, key=lambda i: (df_idx_gantt.at[i, 'start'] if i in df_idx_gantt.index and pd.notna(df_idx_gantt.at[i, 'start']) else pd.Timestamp.min))
+            else: children = children_to_sort
+            for ch in children: trav_gantt(ch)
+        all_children = {child for children_list in tree_gantt.values() for child in children_list}
+        roots = []
+        if not df_idx_gantt.empty and 'project_id_id' in df_idx_gantt.columns:
+            roots = [i for i in tree_gantt if i not in all_children and (i in df_idx_gantt.index and df_idx_gantt.at[i, 'project_id_id'] == pid)]
+        elif tree_gantt: roots = [i for i in tree_gantt if i not in all_children]
+        if not df_idx_gantt.empty and 'start' in df_idx_gantt.columns:
+            roots = sorted(roots, key=lambda i: (df_idx_gantt.at[i, 'start'] if i in df_idx_gantt.index and pd.notna(df_idx_gantt.at[i, 'start']) else pd.Timestamp.min))
+        for r_root in roots: trav_gantt(r_root)
+        if order_gantt and 'id' in df_tasks_for_gantt.columns:
+            df_tasks_for_gantt['__order'] = df_tasks_for_gantt['id'].apply(lambda i: order_gantt.index(i) if i in order_gantt else float('inf'))
+            df_tasks_for_gantt = df_tasks_for_gantt[df_tasks_for_gantt['__order'] != float('inf')]
+        elif not df_tasks_for_gantt.empty:
+             df_tasks_for_gantt['__order'] = range(len(df_tasks_for_gantt))
+        full_df_for_gantt = pd.concat([project_bar.assign(__order=-1), df_tasks_for_gantt], ignore_index=True).sort_values('__order')
 
     fig = px.timeline(
-        full,
-        x_start='start', x_end='end',
-        y='display_name',
-        color='status_cat',
-        color_discrete_map={
-            'Concluída': DONE,
-            'Em Andamento': ACCENT,
-            'Atrasada': DELAYED,
-            'Planejada': PLANNED,
-            'Projeto': PRIMARY
-        },
+        full_df_for_gantt, x_start='start', x_end='end', y='display_name', color='status_cat',
+        color_discrete_map={'Concluída': DONE, 'Em Andamento': ACCENT, 'Atrasada': DELAYED, 'Planejada': PLANNED, 'Em Risco': WARNING, 'Projeto': PRIMARY},
         labels={'status_cat': 'Legenda'}
     )
     fig.update_layout(
-        yaxis={'autorange': 'reversed'},
-        plot_bgcolor='white', paper_bgcolor=BG,
-        margin=dict(t=50),
-        xaxis=dict(
-            tickformat="%d/%m/%Y",
-            dtick="M1",
-            ticklabelmode="period"
-        )
+        yaxis={'autorange': 'reversed'}, 
+        yaxis_title="Nome dos Projetos/Tarefas", # Título do eixo Y adicionado
+        plot_bgcolor='white', 
+        paper_bgcolor=BG, 
+        margin=dict(t=50), 
+        xaxis=dict(tickformat="%d/%m/%Y", dtick="M1", ticklabelmode="period")
     )
-    fig.update_yaxes(
-        categoryorder='array',
-        categoryarray=full['display_name'].tolist()
-    )
-
-    coord = {
-        r['id']: (r['end'], r['display_name'])
-        for _, r in full.iterrows()
-    }
-    for _, r in full.iterrows():
-        for d in r['depend_on_ids_list'] or []:
-            if d in coord:
-                x0, y0 = coord[d]
-                fig.add_annotation(
-                    x=r['start'], y=r['display_name'],
-                    ax=x0, ay=y0,
-                    xref='x', yref='y', axref='x', ayref='y',
-                    showarrow=True, arrowhead=3,
-                    arrowsize=1.2, arrowwidth=1.5,
-                    arrowcolor='#666'
-                )
-
-    for tid, children in tree.items():
-        if children and tid in full['id'].values:
-            row = full[full['id']==tid].iloc[0]
-            fig.add_shape(
-                type='line',
-                x0=row['start'], x1=row['end'],
-                y0=row['display_name'], y1=row['display_name'],
-                xref='x', yref='y',
-                line=dict(color='black', width=3)
-            )
-
-    fig.add_shape(
-        type='line', x0=hoje, x1=hoje,
-        y0=0, y1=1, xref='x', yref='paper',
-        line_dash='dash', line_color='green'
-    )
-    fig.add_annotation(
-        x=hoje, y=1, xref='x', yref='paper',
-        text='Hoje', showarrow=False,
-        yanchor='bottom', align='right'
-    )
-
+    if 'display_name' in full_df_for_gantt.columns and not full_df_for_gantt['display_name'].empty:
+        fig.update_yaxes(categoryorder='array', categoryarray=full_df_for_gantt['display_name'].tolist())
+    if not df_tasks_for_gantt.empty:
+        coord_map = {r['id']: (r['end'], r['display_name']) for _, r in full_df_for_gantt.iterrows() if pd.notna(r.get('id')) and pd.notna(r.get('end')) and pd.notna(r.get('display_name')) and r.get('id') != pid}
+        for _, r_task in full_df_for_gantt.iterrows():
+            if r_task.get('id') == pid: continue 
+            if pd.notna(r_task.get('start')) and pd.notna(r_task.get('display_name')) and 'depend_on_ids_list' in r_task:
+                for dep_id in r_task.get('depend_on_ids_list', []):
+                    if dep_id in coord_map:
+                        x0, y0 = coord_map[dep_id]
+                        fig.add_annotation(x=r_task['start'], y=r_task['display_name'], ax=x0, ay=y0, xref='x', yref='y', axref='x', ayref='y', showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=1.5, arrowcolor='#666')
+        if 'tree_gantt' in locals() and tree_gantt:
+            for parent_id, children_ids in tree_gantt.items():
+                if children_ids and parent_id in full_df_for_gantt['id'].values:
+                    parent_row_df = full_df_for_gantt[full_df_for_gantt['id'] == parent_id]
+                    if not parent_row_df.empty:
+                        parent_row = parent_row_df.iloc[0]
+                        if pd.notna(parent_row.get('start')) and pd.notna(parent_row.get('end')) and pd.notna(parent_row.get('display_name')):
+                            fig.add_shape(type='line', x0=parent_row['start'], x1=parent_row['end'], y0=parent_row['display_name'], y1=parent_row['display_name'], xref='x', yref='y', line=dict(color='black', width=3))
+    fig.add_shape(type='line', x0=hoje, x1=hoje, y0=0, y1=1, xref='x', yref='paper', line_dash='dash', line_color='green')
+    fig.add_annotation(x=hoje, y=1, xref='x', yref='paper', text='Hoje', showarrow=False, yanchor='bottom', align='right')
     return fig
 
-# --- Gantt por departamento ---
-def generate_dept_gantt(df_tasks_sel, df_proj_sel):
-    if df_tasks_sel.empty:
-        fig = go.Figure()
-        fig.update_layout(
-            title='Nenhuma tarefa para o departamento selecionado',
-            plot_bgcolor='white',
-            paper_bgcolor=BG
-        )
-        return fig
+def compute_depths(df_indexed_tasks):
+    depth_dict = {}
+    if df_indexed_tasks.empty or 'parent_id_id' not in df_indexed_tasks.columns or not df_indexed_tasks.index.name == 'id':
+        return pd.Series({idx: 0 for idx in df_indexed_tasks.index} if not df_indexed_tasks.empty and df_indexed_tasks.index.name == 'id' else {})
+    def get_depth_recursive(task_id):
+        if task_id in depth_dict: return depth_dict[task_id]
+        parent_id = df_indexed_tasks.loc[task_id, 'parent_id_id']
+        if pd.isna(parent_id) or parent_id not in df_indexed_tasks.index:
+            depth_dict[task_id] = 0
+            return 0
+        depth = 1 + get_depth_recursive(parent_id)
+        depth_dict[task_id] = depth
+        return depth
+    for tid in df_indexed_tasks.index:
+        if tid not in depth_dict: get_depth_recursive(tid)
+    return pd.Series({idx: depth_dict.get(idx, 0) for idx in df_indexed_tasks.index})
 
+def generate_dept_gantt(all_tasks_df, selected_projects_df, show_tasks=False):
+    if selected_projects_df.empty: 
+        fig = go.Figure().update_layout(title='Nenhum projeto para o departamento selecionado', plot_bgcolor='white', paper_bgcolor=BG)
+        return fig
     hoje = pd.Timestamp.now().normalize()
-    full_gantt_data = pd.DataFrame()
+    gantt_data_list = []
     overall_order_counter = 0
 
-    for _, proj in df_proj_sel.iterrows():
-        pid = proj['id']
-        project_name = proj['name']
+    if 'date_deadline' in all_tasks_df.columns: all_tasks_df['date_deadline'] = pd.to_datetime(all_tasks_df['date_deadline'], errors='coerce')
+    else: all_tasks_df['date_deadline'] = pd.NaT
+    if 'calculated_start' in all_tasks_df.columns: all_tasks_df['start_task'] = pd.to_datetime(all_tasks_df['calculated_start'], errors='coerce')
+    else: all_tasks_df['start_task'] = pd.NaT
 
-        df_proj_tasks = df_tasks_sel[df_tasks_sel['project_id_id'] == pid].copy()
+    for _, project_row in selected_projects_df.iterrows():
+        project_id = project_row['id']
+        project_name = project_row.get('name', f"Projeto ID {project_id}")
+        current_project_tasks = pd.DataFrame()
+        if 'project_id_id' in all_tasks_df.columns and not all_tasks_df.empty:
+            current_project_tasks = all_tasks_df[all_tasks_df['project_id_id'] == project_id].copy()
+        
+        p_start_odoo_proj = pd.to_datetime(project_row.get('date_start', None), errors='coerce')
+        p_start_from_tasks_proj = pd.NaT
+        if not current_project_tasks.empty and 'start_task' in current_project_tasks.columns and current_project_tasks['start_task'].notna().any():
+            p_start_from_tasks_proj = current_project_tasks['start_task'].min()
+        if pd.notna(p_start_odoo_proj): p_start_proj = p_start_odoo_proj
+        elif pd.notna(p_start_from_tasks_proj): p_start_proj = p_start_from_tasks_proj
+        else: p_start_proj = hoje
 
-        ds = proj.get('date_start', None)
-        de = proj.get('date_end', None)
-        p_start = pd.to_datetime(ds) if pd.notna(ds) and not isinstance(ds, bool) \
-                  else df_proj_tasks['calculated_start'].min() if not df_proj_tasks.empty else hoje
-        p_end = pd.to_datetime(de) if pd.notna(de) and not isinstance(de, bool) \
-                  else df_proj_tasks['date_deadline'].max() if not df_proj_tasks.empty else hoje + timedelta(days=1)
+        p_end_odoo_proj = pd.to_datetime(project_row.get('date', None), errors='coerce')
+        p_end_from_tasks_proj = pd.NaT
+        if not current_project_tasks.empty and 'date_deadline' in current_project_tasks.columns and current_project_tasks['date_deadline'].notna().any():
+            p_end_from_tasks_proj = current_project_tasks['date_deadline'].max() 
+        
+        if pd.notna(p_end_odoo_proj): p_end_proj = p_end_odoo_proj
+        elif pd.notna(p_end_from_tasks_proj): p_end_proj = p_end_from_tasks_proj
+        else: p_end_proj = p_start_proj + timedelta(days=1)
+        if pd.notna(p_start_proj) and pd.notna(p_end_proj) and p_end_proj < p_start_proj: p_end_proj = p_start_proj + timedelta(days=1)
+        
+        project_status_val = get_project_overall_status(project_row, current_project_tasks, p_end_proj)
+        project_bar_data = {'id': f'proj_{project_id}', 'display_name': project_name, 'start': p_start_proj, 'end': p_end_proj, 'status_cat': project_status_val, 'depend_on_ids_list': [], 'project_id_id': project_id, '__overall_order': overall_order_counter}
+        gantt_data_list.append(pd.DataFrame([project_bar_data]))
+        overall_order_counter += 1
+        
+        if show_tasks and not current_project_tasks.empty:
+            tasks_to_display = current_project_tasks.copy()
+            tasks_to_display.rename(columns={'start_task': 'start', 'date_deadline': 'deadline'}, inplace=True)
+            for col in ['depend_on_ids_list', 'id', 'name', 'parent_id_id', 'project_id_id', 'status_cat', 'start', 'deadline']:
+                if col not in tasks_to_display.columns:
+                    if col.endswith('_id') or col == 'id': tasks_to_display[col] = None
+                    elif col == 'depend_on_ids_list': tasks_to_display[col] = [[] for _ in range(len(tasks_to_display))]
+                    elif col.startswith('date') or col == 'start' or col == 'deadline': tasks_to_display[col] = pd.NaT
+                    else: tasks_to_display[col] = 'N/A'
+            tasks_to_display['end'] = tasks_to_display.apply(lambda r: max(r['deadline'], hoje) if (r.get('status_cat')=='Em Andamento' and pd.notna(r.get('deadline'))) else (r.get('deadline') if pd.notna(r.get('deadline')) else (r.get('start') + timedelta(days=1) if pd.notna(r.get('start')) else hoje + timedelta(days=1))), axis=1).fillna(tasks_to_display['start'] + timedelta(days=1) if 'start' in tasks_to_display.columns and not tasks_to_display.empty and pd.notna(tasks_to_display['start'].iloc[0] if not tasks_to_display['start'].empty else pd.NaT) else hoje + timedelta(days=1) )
+            df_idx_dept = tasks_to_display.set_index('id') if 'id' in tasks_to_display.columns and not tasks_to_display.empty else pd.DataFrame()
+            if not df_idx_dept.empty:
+                tasks_to_display['depth'] = tasks_to_display['id'].map(compute_depths(df_idx_dept)).fillna(0).astype(int)
+                tasks_to_display['display_name'] = tasks_to_display['depth'].apply(lambda d: '   '*d) + tasks_to_display['name']
+            else:
+                tasks_to_display['depth'] = 0
+                tasks_to_display['display_name'] = tasks_to_display['name'] if 'name' in tasks_to_display else "Tarefa"
+            tasks_to_display['__overall_order'] = tasks_to_display.reset_index().index + overall_order_counter
+            gantt_data_list.append(tasks_to_display)
+            overall_order_counter += len(tasks_to_display)
 
-        project_bar = pd.DataFrame([{
-            'id': f'proj_{pid}',
-            'display_name': project_name,
-            'start': p_start,
-            'end': p_end,
-            'status_cat': 'Projeto',
-            'depend_on_ids_list': [],
-            'project_id_id': pid
-        }])
-
-        if not df_proj_tasks.empty:
-            df_proj_tasks['start'] = pd.to_datetime(df_proj_tasks['calculated_start'])
-            df_proj_tasks['deadline'] = pd.to_datetime(df_proj_tasks['date_deadline'])
-            df_proj_tasks['end'] = df_proj_tasks.apply(
-                lambda r: max(r['deadline'], hoje) if (
-                    r['status_cat']=='Em Andamento' and pd.notna(r['deadline'])
-                ) else (
-                    r['deadline'] if pd.notna(r['deadline']) else hoje
-                ),
-                axis=1
-            ).fillna(df_proj_tasks['start'] + timedelta(days=1))
-
-            mask_no_deps_proj = df_proj_tasks['depend_on_ids_list'].apply(
-                lambda l: isinstance(l, list) and len(l) == 0
-            )
-            df_proj_tasks.loc[mask_no_deps_proj, 'start'] = p_start
-
-            df_idx = df_proj_tasks.set_index('id')
-            df_proj_tasks['depth'] = df_proj_tasks['id'].map(compute_depths(df_idx)).fillna(0).astype(int)
-            df_proj_tasks['display_name'] = df_proj_tasks['depth'].apply(
-                lambda d: '   '*d
-            ) + df_proj_tasks['name']
-
-            tree = {tid: [] for tid in df_proj_tasks['id']}
-            for _, r in df_proj_tasks.iterrows():
-                pid_p = r['parent_id_id']
-                if pd.notna(pid_p) and pid_p in tree:
-                    tree[pid_p].append(r['id'])
-
-            order = []
-            def trav(tid):
-                order.append(tid)
-                for ch in sorted(
-                    tree.get(tid, []),
-                    key=lambda i: df_idx.at[i, 'start']
-                ):
-                    trav(ch)
-
-            all_children_in_project = set()
-            for children_list in tree.values():
-                all_children_in_project.update(children_list)
-
-            project_roots = [
-                i for i in df_proj_tasks['id'].unique()
-                if i not in all_children_in_project and df_idx.at[i, 'project_id_id'] == pid
-            ]
-            project_roots = sorted(project_roots, key=lambda i: df_idx.at[i, 'start'])
-
-            for rt in project_roots:
-                trav(rt)
-
-            df_proj_tasks['__project_order'] = df_proj_tasks['id'].apply(
-                lambda i: order.index(i) if i in order else float('inf')
-            )
-            df_proj_tasks = df_proj_tasks[df_proj_tasks['__project_order'] != float('inf')]
-            df_proj_tasks = df_proj_tasks.sort_values('__project_order').reset_index(drop=True)
-            df_proj_tasks['__overall_order'] = df_proj_tasks.index + overall_order_counter + 1
-        else:
-            df_proj_tasks = pd.DataFrame()
-
-        project_bar['__overall_order'] = overall_order_counter
-        overall_order_counter += len(df_proj_tasks) + 1
-
-        if not df_proj_tasks.empty:
-            combined_proj_data = pd.concat([project_bar, df_proj_tasks])
-        else:
-            combined_proj_data = project_bar
-
-        full_gantt_data = pd.concat([full_gantt_data, combined_proj_data], ignore_index=True)
-
-    full_gantt_data = full_gantt_data.sort_values('__overall_order').reset_index(drop=True)
-
-    fig = px.timeline(
-        full_gantt_data,
-        x_start='start', x_end='end',
-        y='display_name',
-        color='status_cat',
-        color_discrete_map={
-            'Concluída': DONE,
-            'Em Andamento': ACCENT,
-            'Atrasada': DELAYED,
-            'Planejada': PLANNED,
-            'Projeto': PRIMARY
-        },
-        labels={'status_cat': 'Legenda'}
-    )
+    if not gantt_data_list:
+        fig = go.Figure().update_layout(title='Nenhum dado para exibir no Gantt do departamento.', plot_bgcolor='white', paper_bgcolor=BG)
+        return fig
+    full_gantt_data_dept = pd.concat(gantt_data_list, ignore_index=True)
+    full_gantt_data_dept = full_gantt_data_dept.sort_values('__overall_order').reset_index(drop=True)
+    fig = px.timeline(full_gantt_data_dept, x_start='start', x_end='end', y='display_name', color='status_cat', color_discrete_map={'Concluída': DONE, 'Em Andamento': ACCENT, 'Atrasada': DELAYED, 'Planejada': PLANNED, 'Em Risco': WARNING}, labels={'status_cat': 'Legenda'})
     fig.update_layout(
-        yaxis={'autorange': 'reversed'},
-        plot_bgcolor='white', paper_bgcolor=BG,
-        margin=dict(t=50),
-        xaxis=dict(
-            tickformat="%d/%m/%Y",
-            dtick="M1",
-            ticklabelmode="period"
-        )
+        yaxis={'autorange': 'reversed'}, 
+        yaxis_title="Nome dos Projetos/Tarefas", # Título do eixo Y adicionado
+        plot_bgcolor='white', 
+        paper_bgcolor=BG, 
+        margin=dict(t=50), 
+        xaxis=dict(tickformat="%d/%m/%Y", dtick="M1", ticklabelmode="period")
     )
-    fig.update_yaxes(
-        categoryorder='array',
-        categoryarray=full_gantt_data['display_name'].tolist()
-    )
-
-    for _, proj in df_proj_sel.iterrows():
-        pid = proj['id']
-        project_specific_data = full_gantt_data[
-            (full_gantt_data['project_id_id'] == pid) | (full_gantt_data['id'] == f'proj_{pid}')
-        ].copy()
-
-        current_project_tasks_df = df_tasks_sel[df_tasks_sel['project_id_id'] == pid].copy()
-        current_project_tree = {tid: [] for tid in current_project_tasks_df['id']}
-        for _, r in current_project_tasks_df.iterrows():
-            pid_p = r['parent_id_id']
-            if pd.notna(pid_p) and pid_p in current_project_tree:
-                current_project_tree[pid_p].append(r['id'])
-
-        coord = {
-            r['id']: (r['end'], r['display_name'])
-            for _, r in project_specific_data.iterrows() if r['id'] != f'proj_{pid}'
-        }
-        for _, r in project_specific_data.iterrows():
-            if r['id'] == f'proj_{pid}':
-                continue
-            for d in r['depend_on_ids_list'] or []:
-                if d in coord:
-                    x0, y0 = coord[d]
-                    fig.add_annotation(
-                        x=r['start'], y=r['display_name'],
-                        ax=x0, ay=y0,
-                        xref='x', yref='y', axref='x', ayref='y',
-                        showarrow=True, arrowhead=3,
-                        arrowsize=1.2, arrowwidth=1.5,
-                        arrowcolor='#666'
-                    )
-
-        for tid, children in current_project_tree.items():
-            if children and tid in project_specific_data['id'].values:
-                row = project_specific_data[project_specific_data['id'] == tid].iloc[0]
-                fig.add_shape(
-                    type='line',
-                    x0=row['start'], x1=row['end'],
-                    y0=row['display_name'], y1=row['display_name'],
-                    xref='x', yref='y',
-                    line=dict(color='black', width=3)
-                )
-
-    fig.add_shape(
-        type='line', x0=hoje, x1=hoje,
-        y0=0, y1=1, xref='x', yref='paper',
-        line_dash='dash', line_color='green'
-    )
-    fig.add_annotation(
-        x=hoje, y=1, xref='x', yref='paper',
-        text='Hoje', showarrow=False,
-        yanchor='bottom', align='right'
-    )
+    if 'display_name' in full_gantt_data_dept.columns and not full_gantt_data_dept['display_name'].empty:
+        fig.update_yaxes(categoryorder='array', categoryarray=full_gantt_data_dept['display_name'].tolist())
+    fig.add_shape(type='line', x0=hoje, x1=hoje, y0=0, y1=1, xref='x', yref='paper', line_dash='dash', line_color='green')
+    fig.add_annotation(x=hoje, y=1, xref='x', yref='paper', text='Hoje', showarrow=False, yanchor='bottom', align='right')
     return fig
 
-# === Layout e callbacks ===
-
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
-layout_style = {'fontFamily': FONT, 'backgroundColor': BG, 'padding': 20}
+layout_style = {'fontFamily': FONT, 'backgroundColor': BG, 'padding': '20px'}
 app.layout = html.Div(style=layout_style, children=[
-    dcc.Interval(
-        id='interval-component',
-        interval=60*1000, # em milissegundos, 60 segundos
-        n_intervals=0
-    ),
-    dcc.Store(id='stored-projects'),
-    dcc.Store(id='stored-tasks'),
-
-    html.H1('Dashboard DAC Engenharia',
-             style={'color':PRIMARY,'textAlign':'center'}),
+    dcc.Interval(id='interval-component', interval=120*1000, n_intervals=0),
+    dcc.Store(id='stored-projects'), dcc.Store(id='stored-tasks'),
+    html.H1('Dashboard DAC Engenharia', style={'color':PRIMARY,'textAlign':'center', 'marginBottom':'20px'}),
     dcc.Tabs(id='tabs', value='tab-summary', children=[
-        dcc.Tab(label='Resumo', value='tab-summary', children=[
-            dcc.Graph(id='summary-graph')
-        ], style={'padding':20}),
+        dcc.Tab(label='Resumo', value='tab-summary', children=[dcc.Graph(id='summary-graph')], style={'padding':'15px'}, selected_style={'padding':'15px'}),
         dcc.Tab(label='Cronograma', value='tab-gantt', children=[
-            html.Div(style={'display':'flex','gap':'10px','marginBottom':'20px'}, children=[
-                html.Div(style={'flex':1}, children=[
-                    html.Label('Departamento'),
-                    dcc.Dropdown(
-                        id='dept-dropdown',
-                        placeholder='Selecione departamento',
-                        style={'width':'100%','height':'40px'}
-                    )
-                ]),
-                html.Div(style={'flex':2}, children=[
-                    html.Label('Projeto'),
-                    dcc.Dropdown(
-                        id='project-dropdown',
-                        placeholder='Selecione projeto',
-                        style={'width':'100%','height':'40px'}
-                    )
-                ])
+            html.Div(style={'display':'flex','gap':'15px','marginBottom':'20px', 'alignItems':'flex-end'}, children=[
+                html.Div(style={'flex':1}, children=[html.Label('Departamento:'), dcc.Dropdown(id='dept-dropdown', placeholder='Selecione departamento', style={'width':'100%'})]),
+                html.Div(style={'flex':2}, children=[html.Label('Projeto:'), dcc.Dropdown(id='project-dropdown', placeholder='Selecione projeto', style={'width':'100%'})])
             ]),
-            dcc.Graph(id='full-gantt', style={'height':'700px'}),
-            html.Hr(style={'margin-top': '30px', 'margin-bottom': '20px'}),
-            html.H3('Detalhes das Tarefas', style={'color': PRIMARY, 'textAlign': 'center'}),
+            dcc.Loading(type="default", children=dcc.Graph(id='full-gantt', style={'height':'700px'})),
+            html.Hr(style={'marginTop': '30px', 'marginBottom': '20px'}),
+            html.H3('Detalhes das Tarefas do Projeto Selecionado', style={'color': PRIMARY, 'textAlign': 'center', 'marginBottom':'15px'}),
             dash_table.DataTable(
                 id='tasks-table',
                 columns=[
-                    {"name": "Tarefa", "id": "name"},
-                    {"name": "Status", "id": "status_cat"},
-                    {"name": "Projeto", "id": "name_project"}, # Nova coluna de projeto
-                    {"name": "Início Calculado", "id": "calculated_start"},
-                    {"name": "Prazo", "id": "date_deadline"},
-                    {"name": "Departamento", "id": "department"},
-                    {"name": "Dependências", "id": "depend_on_names"}
-                ],
-                filter_action="native",
-                sort_action="native",
-                page_action="native",
-                page_size=15, # Aumentado o número de tarefas por página
-                style_table={'overflowX': 'auto'},
-                style_header={
-                    'backgroundColor': PRIMARY,
-                    'color': 'white',
-                    'fontWeight': 'bold'
-                },
-                style_data={
-                    'whiteSpace': 'normal',
-                    'height': 'auto',
-                    'fontSize': '0.85em', # Aumentado o tamanho da fonte da tabela
-                    'textAlign': 'center' # Centraliza o texto
-                },
-                style_cell={ # Garante que todas as células estejam centralizadas
-                    'textAlign': 'center'
-                },
+                    {"name": "Tarefa", "id": "name"}, {"name": "Status", "id": "status_cat"},
+                    {"name": "Projeto", "id": "name_project"}, {"name": "Início Calc.", "id": "calculated_start"},
+                    {"name": "Prazo", "id": "date_deadline"}, {"name": "Departamento", "id": "department"},
+                    {"name": "Dependências", "id": "depend_on_names"}],
+                filter_action="native", sort_action="native", page_action="native", page_size=10,
+                style_table={'overflowX': 'auto', 'minWidth': '100%'},
+                style_header={'backgroundColor': PRIMARY, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'left'},
+                style_data={'whiteSpace': 'normal', 'height': 'auto', 'fontSize': '0.9em'},
+                style_cell={'textAlign': 'left', 'padding': '8px', 'minWidth': '100px', 'width': '150px', 'maxWidth': '200px'},
                 style_data_conditional=[
-                    {
-                        'if': {'filter_query': '{is_delayed} = true'},
-                        'backgroundColor': '#ffebeb',
-                        'color': DELAYED
-                    }
+                    {'if': {'column_id': 'name'}, 'minWidth': '200px', 'width': '250px', 'maxWidth': '300px'},
+                    {'if': {'filter_query': '{status_cat} = "Atrasada"'}, 'backgroundColor': '#ffebeb', 'color': DELAYED},
+                    {'if': {'filter_query': '{status_cat} = "Em Risco"'}, 'backgroundColor': '#fff3e0', 'color': WARNING},
                 ]
             )
-        ], style={'padding':20})
+        ], style={'padding':'15px'}, selected_style={'padding':'15px'})
     ])
 ])
 
 @app.callback(
-    Output('stored-projects', 'data'),
-    Output('stored-tasks', 'data'),
-    Input('interval-component', 'n_intervals')
+    [Output('stored-projects', 'data'), Output('stored-tasks', 'data')],
+    [Input('interval-component', 'n_intervals'),
+     Input('tabs', 'value')]
 )
-def get_data_from_odoo(n):
+def get_data_from_odoo_callback(n_intervals, tab_value):
     return load_and_prepare_data()
 
-@app.callback(
-    Output('dept-dropdown', 'options'),
-    Input('stored-projects', 'data')
-)
-def update_dept_dropdown_options(stored_projects_json):
+@app.callback(Output('dept-dropdown', 'options'), Input('stored-projects', 'data'))
+def update_dept_dropdown_options_callback(stored_projects_json):
     if stored_projects_json:
-        df_projects = pd.read_json(io.StringIO(stored_projects_json), orient='split')
-        departments = sorted(df_projects['department'].dropna().unique())
-        return [{'label': d, 'value': d} for d in departments]
+        df_projects_cb = pd.read_json(io.StringIO(stored_projects_json), orient='split')
+        if 'department' in df_projects_cb.columns and not df_projects_cb.empty:
+            departments = sorted([d for d in df_projects_cb['department'].dropna().unique() if d != 'Sem Departamento'])
+            if 'Sem Departamento' in df_projects_cb['department'].unique(): departments.append('Sem Departamento')
+            return [{'label': d_opt, 'value': d_opt} for d_opt in departments]
     return []
 
 @app.callback(
-    Output('project-dropdown','options'),
-    Output('project-dropdown','value'),
-    Input('dept-dropdown','value'),
-    Input('stored-projects', 'data')
-)
-def update_project_list(dept, stored_projects_json):
-    if not dept or not stored_projects_json:
-        return [], None
-    df_projects = pd.read_json(io.StringIO(stored_projects_json), orient='split')
-    df = df_projects[df_projects['department'] == dept]
-    opts = [{'label': n, 'value': i} for i, n in zip(df['id'], df['name'])]
-    return opts, None
+    [Output('project-dropdown','options'), Output('project-dropdown','value')],
+    [Input('dept-dropdown','value'), Input('stored-projects', 'data')],
+    State('project-dropdown','value'))
+def update_project_list_callback(dept_val, stored_projects_json, current_project_val):
+    if not stored_projects_json: return [], None
+    df_projects_cb2 = pd.read_json(io.StringIO(stored_projects_json), orient='split')
+    options, new_project_value = [], None
+    if 'department' in df_projects_cb2.columns and 'id' in df_projects_cb2.columns and 'name' in df_projects_cb2.columns:
+        if dept_val:
+            df_filtered_proj = df_projects_cb2[df_projects_cb2['department'] == dept_val]
+            options = sorted([{'label': name_opt, 'value': id_opt} for id_opt, name_opt in zip(df_filtered_proj['id'], df_filtered_proj['name'])], key=lambda x: x['label'])
+            if current_project_val and any(opt['value'] == current_project_val for opt in options): new_project_value = current_project_val
+            else: new_project_value = None
+        else:
+            options = []
+            new_project_value = None
+    return options, new_project_value
 
 @app.callback(
-    Output('full-gantt', 'figure'),
-    Output('tasks-table', 'data'),
-    Input('dept-dropdown', 'value'),
-    Input('project-dropdown', 'value'),
-    Input('stored-projects', 'data'),
-    Input('stored-tasks', 'data')
-)
-def update_gantt_and_table(dept, pid, stored_projects_json, stored_tasks_json):
-    if not stored_projects_json or not stored_tasks_json:
-        fig = go.Figure()
-        fig.update_layout(title='Carregando dados...', plot_bgcolor='white', paper_bgcolor=BG)
-        return fig, []
-
-    all_projects = pd.read_json(io.StringIO(stored_projects_json), orient='split')
-    all_tasks = pd.read_json(io.StringIO(stored_tasks_json), orient='split')
-    
-    all_tasks['calculated_start'] = pd.to_datetime(all_tasks['calculated_start'], errors='coerce')
-    all_tasks['date_deadline'] = pd.to_datetime(all_tasks['date_deadline'], errors='coerce')
-
-    if pid:
-        df_sel_gantt = all_tasks[all_tasks['project_id_id'] == pid]
-        df_sel_table = df_sel_gantt.copy()
-        
-        df_sel_table['calculated_start'] = df_sel_table['calculated_start'].dt.strftime('%d/%m/%Y').fillna('')
-        df_sel_table['date_deadline'] = df_sel_table['date_deadline'].dt.strftime('%d/%m/%Y').fillna('')
-        df_sel_table['depend_on_names'] = df_sel_table['depend_on_names'].apply(
-            lambda x: ', '.join(x) if isinstance(x, list) else ''
-        )
-
-        fig = generate_full_gantt(df_sel_gantt, pid, all_projects)
-        return fig, df_sel_table[[
-            'name', 'status_cat', 'name_project', 'calculated_start', 'date_deadline', 'department', 'depend_on_names', 'is_delayed'
-        ]].to_dict('records')
-    
-    if dept:
-        df_proj = all_projects[all_projects['department'] == dept]
-        df_sel_gantt = all_tasks[all_tasks['project_id_id'].isin(df_proj['id'])]
-        df_sel_table = df_sel_gantt.copy()
-
-        df_sel_table['calculated_start'] = df_sel_table['calculated_start'].dt.strftime('%d/%m/%Y').fillna('')
-        df_sel_table['date_deadline'] = df_sel_table['date_deadline'].dt.strftime('%d/%m/%Y').fillna('')
-        df_sel_table['depend_on_names'] = df_sel_table['depend_on_names'].apply(
-            lambda x: ', '.join(x) if isinstance(x, list) else ''
-        )
-
-        fig = generate_dept_gantt(df_sel_gantt, df_proj)
-        return fig, df_sel_table[[
-            'name', 'status_cat', 'name_project', 'calculated_start', 'date_deadline', 'department', 'depend_on_names', 'is_delayed'
-        ]].to_dict('records')
-    
-    fig = go.Figure()
-    fig.update_layout(
-        title='Selecione projeto ou departamento para visualizar o cronograma',
-        plot_bgcolor='white', paper_bgcolor=BG
-    )
-    return fig, []
+    [Output('full-gantt', 'figure'), Output('tasks-table', 'data')],
+    [Input('dept-dropdown', 'value'), Input('project-dropdown', 'value'),
+     Input('stored-projects', 'data'), Input('stored-tasks', 'data')])
+def update_gantt_and_table_callback(dept_val_gantt, pid_val_gantt, stored_projects_json, stored_tasks_json):
+    fig_default = go.Figure().update_layout(title='Selecione um departamento ou projeto para visualizar o cronograma.', plot_bgcolor='white', paper_bgcolor=BG, yaxis_visible=False, xaxis_visible=False)
+    if not stored_projects_json or not stored_tasks_json: return fig_default, []
+    all_projects_cb = pd.DataFrame(); all_tasks_cb = pd.DataFrame()
+    try:
+        all_projects_cb = pd.read_json(io.StringIO(stored_projects_json), orient='split')
+        all_tasks_cb = pd.read_json(io.StringIO(stored_tasks_json), orient='split')
+    except ValueError as e:
+        print(f"ATENÇÃO: Erro ao ler JSON dos dados armazenados: {e}")
+        return fig_default, []
+    if 'calculated_start' in all_tasks_cb.columns: all_tasks_cb['calculated_start'] = pd.to_datetime(all_tasks_cb['calculated_start'], errors='coerce')
+    if 'date_deadline' in all_tasks_cb.columns: all_tasks_cb['date_deadline'] = pd.to_datetime(all_tasks_cb['date_deadline'], errors='coerce')
+    if all_projects_cb.empty: return fig_default.update_layout(title='Dados de projetos não disponíveis ou vazios.'), []
+    df_sel_table_cb = pd.DataFrame(); current_fig = fig_default
+    if pid_val_gantt:
+        df_sel_gantt_tasks_cb = pd.DataFrame(columns=all_tasks_cb.columns)
+        if 'project_id_id' in all_tasks_cb.columns and not all_tasks_cb.empty:
+            df_sel_gantt_tasks_cb = all_tasks_cb[all_tasks_cb['project_id_id'] == pid_val_gantt].copy()
+        df_sel_table_cb = df_sel_gantt_tasks_cb.copy()
+        if pid_val_gantt in all_projects_cb['id'].values: current_fig = generate_full_gantt(df_sel_gantt_tasks_cb, pid_val_gantt, all_projects_cb)
+        else: current_fig = fig_default.update_layout(title=f"Projeto ID {pid_val_gantt} não encontrado nos dados carregados.")
+    elif dept_val_gantt:
+        df_proj_in_dept_cb = all_projects_cb[all_projects_cb['department'] == dept_val_gantt]
+        if df_proj_in_dept_cb.empty: current_fig.update_layout(title=f"Nenhum projeto encontrado para o departamento '{dept_val_gantt}'.", yaxis_visible=False, xaxis_visible=False)
+        else:
+            if 'project_id_id' in all_tasks_cb.columns and not all_tasks_cb.empty:
+                df_sel_table_cb = all_tasks_cb[all_tasks_cb['project_id_id'].isin(df_proj_in_dept_cb['id'])].copy() 
+            current_fig = generate_dept_gantt(all_tasks_cb, df_proj_in_dept_cb, show_tasks=False)
+    table_data_cb = []
+    if not df_sel_table_cb.empty:
+        table_cols_display = ["name", "status_cat", "name_project", "calculated_start", "date_deadline", "department", "depend_on_names"]
+        df_table_final = df_sel_table_cb.copy()
+        for col_tbl in table_cols_display:
+            if col_tbl not in df_table_final.columns:
+                if col_tbl.endswith('_date') or col_tbl == 'calculated_start': df_table_final[col_tbl] = pd.NaT
+                elif col_tbl == 'depend_on_names': df_table_final[col_tbl] = [[] for _ in range(len(df_table_final))]
+                else: df_table_final[col_tbl] = ''
+        df_table_final['calculated_start'] = pd.to_datetime(df_table_final['calculated_start'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('N/D')
+        df_table_final['date_deadline'] = pd.to_datetime(df_table_final['date_deadline'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('N/D')
+        df_table_final['depend_on_names'] = df_table_final['depend_on_names'].apply(lambda x: ', '.join(x) if isinstance(x, list) and x else ('N/A' if not x or not isinstance(x, list) else str(x)))
+        table_data_cb = df_table_final[table_cols_display].to_dict('records')
+    return current_fig, table_data_cb
 
 @app.callback(
     Output('summary-graph','figure'),
-    Input('tabs','value'),
-    Input('stored-projects', 'data'),
-    Input('stored-tasks', 'data')
-)
-def update_summary(tab, stored_projects_json, stored_tasks_json):
-    if tab != 'tab-summary' or not stored_projects_json or not stored_tasks_json:
-        return dash.no_update
-
-    df_projects = pd.read_json(io.StringIO(stored_projects_json), orient='split')
-    df_tasks = pd.read_json(io.StringIO(stored_tasks_json), orient='split')
-
-    df_tc = df_tasks.groupby(['project_id_id','status_cat']).size().unstack(fill_value=0).reset_index()
-    df_tc = df_tc.rename(columns={
-        'Concluída':'done_tasks', 'Em Andamento':'open_tasks',
-        'Atrasada':'delayed_tasks','Planejada':'planned_tasks'
-    })
-    df_tc['total_tasks'] = df_tc[['done_tasks','open_tasks','delayed_tasks','planned_tasks']].sum(axis=1)
-    df_tc = pd.merge(df_tc, df_projects[['id','department']],
-                     left_on='project_id_id', right_on='id', how='left')
-    df_summary = df_tc.groupby('department')[[
-        'done_tasks','open_tasks','delayed_tasks','planned_tasks','total_tasks'
-    ]].sum().reset_index()
-    df_proj = df_projects.groupby('department').size().reset_index(name='num_projects')
-    df_summary = pd.merge(df_proj, df_summary, on='department')
-    fig = px.bar(
-        df_summary,
-        x='department',
-        y=['num_projects','total_tasks','open_tasks','delayed_tasks','planned_tasks','done_tasks'],
-        barmode='group',
-        labels={'department':'Departamento','value':'Quantidade','variable':'Métrica'},
-        color_discrete_map={
-            'num_projects':PRIMARY,
-            'total_tasks':LIGHT_BLUE,
-            'open_tasks':ACCENT,
-            'delayed_tasks':DELAYED,
-            'planned_tasks':PLANNED,
-            'done_tasks':DONE
-        }
-    )
-    mapping = {
-        'num_projects':'Projetos','total_tasks':'Total de Tarefas',
-        'open_tasks':'Em Andamento','delayed_tasks':'Atrasadas',
-        'planned_tasks':'Planejadas','done_tasks':'Concluídas'
-    }
-    for key,name in mapping.items():
-        fig.update_traces(selector=lambda t:t.name==key, name=name)
-    fig.update_layout(
-        plot_bgcolor='white', paper_bgcolor=BG,
-        legend_title_text='Métrica',
-        xaxis_title='Departamento', yaxis_title='Quantidade'
-    )
-    return fig
+    [Input('tabs','value'), Input('stored-projects', 'data'), Input('stored-tasks', 'data')])
+def update_summary_callback(tab_val, stored_projects_json, stored_tasks_json):
+    fig_empty_summary_cb = go.Figure().update_layout(title='Resumo não disponível.', plot_bgcolor='white', paper_bgcolor=BG, yaxis_visible=False, xaxis_visible=False)
+    if tab_val != 'tab-summary': return dash.no_update 
+    if not stored_projects_json : return fig_empty_summary_cb
+    df_projects_sum = pd.DataFrame(); df_tasks_sum = pd.DataFrame()
+    try:
+        df_projects_sum = pd.read_json(io.StringIO(stored_projects_json), orient='split')
+        if stored_tasks_json: df_tasks_sum = pd.read_json(io.StringIO(stored_tasks_json), orient='split')
+    except ValueError as e:
+        print(f"ATENÇÃO: Erro ao ler JSON dos dados armazenados para resumo: {e}")
+        return fig_empty_summary_cb
+    if df_projects_sum.empty: return fig_empty_summary_cb.update_layout(title='Nenhum projeto para resumir.')
+    df_task_counts_per_project = pd.DataFrame()
+    if not df_tasks_sum.empty and 'project_id_id' in df_tasks_sum.columns and 'status_cat' in df_tasks_sum.columns:
+        df_task_counts_per_project = df_tasks_sum.groupby(['project_id_id','status_cat']).size().unstack(fill_value=0)
+        status_map_for_summary = {'Concluída':'done_tasks', 'Em Andamento':'inprogress_tasks', 'Atrasada':'delayed_tasks_individual', 'Planejada':'planned_tasks', 'Em Risco': 'at_risk_tasks'} 
+        df_task_counts_per_project = df_task_counts_per_project.rename(columns=status_map_for_summary)
+        for col_name in status_map_for_summary.values():
+            if col_name not in df_task_counts_per_project: df_task_counts_per_project[col_name] = 0
+        task_sum_cols = [col for col in status_map_for_summary.values() if col in df_task_counts_per_project.columns]
+        df_task_counts_per_project['total_tasks'] = df_task_counts_per_project[task_sum_cols].sum(axis=1)
+        df_task_counts_per_project = df_task_counts_per_project.reset_index()
+    df_summary_merged = pd.DataFrame()
+    if 'id' in df_projects_sum.columns and 'department' in df_projects_sum.columns:
+        df_summary_merged = pd.merge(df_projects_sum[['id', 'department']], df_task_counts_per_project, left_on='id', right_on='project_id_id', how='left')
+        task_count_cols_to_fill = list(status_map_for_summary.values()) + ['total_tasks']
+        for col in task_count_cols_to_fill:
+            if col in df_summary_merged.columns: df_summary_merged[col] = df_summary_merged[col].fillna(0).astype(int)
+            else: df_summary_merged[col] = 0
+    else: 
+        print("ATENÇÃO: 'id' ou 'department' faltando em df_projects_sum para resumo.")
+        return fig_empty_summary_cb.update_layout(title='Dados de projetos incompletos para resumo.')
+    df_summary_by_dept = pd.DataFrame()
+    if 'department' in df_summary_merged.columns:
+        df_proj_counts_by_dept = df_projects_sum.groupby('department').size().reset_index(name='num_projects')
+        sum_cols_for_dept_group = [col for col in task_count_cols_to_fill if col in df_summary_merged.columns]
+        if sum_cols_for_dept_group: df_grouped_tasks_by_dept = df_summary_merged.groupby('department')[sum_cols_for_dept_group].sum().reset_index()
+        else:
+            df_grouped_tasks_by_dept = pd.DataFrame({'department': df_summary_merged['department'].unique()})
+            for col_s in sum_cols_for_dept_group: df_grouped_tasks_by_dept[col_s] = 0
+        if not df_proj_counts_by_dept.empty: df_summary_by_dept = pd.merge(df_proj_counts_by_dept, df_grouped_tasks_by_dept, on='department', how='left').fillna(0)
+        elif not df_grouped_tasks_by_dept.empty :
+             df_summary_by_dept = df_grouped_tasks_by_dept
+             if 'num_projects' not in df_summary_by_dept.columns: df_summary_by_dept['num_projects'] = 0
+    if df_summary_by_dept.empty or 'department' not in df_summary_by_dept.columns: return fig_empty_summary_cb.update_layout(title='Não foi possível construir o resumo por departamento.')
+    plot_metrics_map = {'num_projects':'Projetos', 'total_tasks':'Total Tarefas', 'inprogress_tasks':'Tarefas em Andamento', 'delayed_tasks_individual':'Tarefas Atrasadas', 'planned_tasks':'Tarefas Planejadas', 'done_tasks':'Tarefas Concluídas'}
+    plot_cols = [col for col in plot_metrics_map.keys() if col in df_summary_by_dept.columns]
+    if not plot_cols: return fig_empty_summary_cb.update_layout(title='Métricas de resumo não encontradas para plotagem.')
+    fig_summary = px.bar(df_summary_by_dept, x='department', y=plot_cols, barmode='group', labels={'department':'Departamento','value':'Quantidade','variable':'Métrica'}, color_discrete_map={'num_projects':PRIMARY, 'total_tasks':LIGHT_BLUE, 'inprogress_tasks':ACCENT, 'delayed_tasks_individual':DELAYED, 'planned_tasks':PLANNED, 'done_tasks':DONE})
+    fig_summary.for_each_trace(lambda t: t.update(name=plot_metrics_map.get(t.name, t.name)))
+    fig_summary.update_layout(plot_bgcolor='white', paper_bgcolor=BG, legend_title_text='Métricas de Tarefas', xaxis_title='Departamento', yaxis_title='Quantidade')
+    return fig_summary
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8050)
