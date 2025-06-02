@@ -18,10 +18,64 @@ BG = '#f9f9f9'
 FONT = 'Helvetica, Arial, sans-serif'
 LIGHT_BLUE = '#add8e6'
 
-# === Carrega e prepara dados ===
+# === Nova função de classificação de status da tarefa ===
+def classify_task_status_revised(r, hoje_param):
+    # Colunas esperadas em 'r' (linha do DataFrame):
+    # 'is_final_state' (bool) - Nova: True se a tarefa está concluída ou cancelada.
+    # 'is_actually_delayed' (bool) - Nova: True se não finalizada e prazo passou.
+    # 'stage_id_name' (str) - Nome do estágio no Kanban.
+    # 'is_open' (bool) - Original: Baseado no 'state' interno do Odoo.
+    # 'date_deadline' (datetime) - Prazo da tarefa.
+
+    if r['is_final_state']: # Prioridade 1: Tarefa em estado final
+        return 'Concluída' # Trata concluídas e canceladas como "não ativas"
+
+    if r['is_actually_delayed']: # Prioridade 2: Tarefa efetivamente atrasada
+        return 'Atrasada'
+
+    stage_name = str(r.get('stage_id_name', '')).lower() # Nome do estágio, normalizado
+
+    # Palavras-chave para estágios (ajuste conforme os nomes reais no seu Odoo)
+    # Estas listas ajudam a interpretar o significado do estágio Kanban.
+    planned_stage_keywords = [
+        'planejad', 'a fazer', 'to do', 'backlog', 'novo', 
+        'pendente', 'aguardando', 'programada', 'em espera', 'aprovad' # 'aprovad' pode significar pronto para iniciar = Planejada
+    ]
+    inprogress_stage_keywords = [
+        'em andamento', 'em progresso', 'fazendo', 'in progress', 
+        'desenvolvimento', 'em execução', 'trabalhando'
+    ]
+
+    # Prioridade 3: Estágio Kanban indica "Planejada" explicitamente
+    if any(keyword in stage_name for keyword in planned_stage_keywords):
+        return 'Planejada'
+            
+    # Prioridade 4: Estágio Kanban indica "Em Andamento" explicitamente
+    if any(keyword in stage_name for keyword in inprogress_stage_keywords):
+        return 'Em Andamento'
+
+    # Prioridade 5: Baseado no 'state' interno ('is_open') se o estágio não foi conclusivo
+    # 'is_open' é True se state for '01_in_progress', '02_changes_requested', '03_approved'
+    # Se '03_approved' NÃO estiver em planned_stage_keywords, pode ser interpretado como Em Andamento aqui.
+    if r.get('is_open', False):
+        return 'Em Andamento'
+
+    # Prioridade 6: Fallback para "Planejada" (baseado em prazo futuro ou ausência de prazo)
+    # Se a tarefa não foi classificada como 'is_open' (pelo state interno) e não se encaixou acima.
+    deadline = r.get('date_deadline') # Já deve ser datetime ou NaT
+    if (pd.notna(deadline) and deadline >= hoje_param) or pd.isna(deadline):
+        return 'Planejada'
+    
+    # Default final: Se ainda ambíguo (ex: prazo passou mas não foi pega por 'is_actually_delayed')
+    # Isso é improvável se a lógica anterior estiver correta.
+    # Mais seguro retornar 'Planejada' para evitar falsos "Em Andamento".
+    return 'Planejada'
+
+# === Carrega e prepara dados (MODIFICADO) ===
 def load_and_prepare_data():
     df_projects = odoo_client.get_projects()
     df_tasks = odoo_client.get_tasks()
+    hoje = pd.Timestamp.now().normalize()
 
     if df_projects.empty and df_tasks.empty:
         print("ATENÇÃO: Não foi possível carregar dados de projetos nem de tarefas do Odoo.")
@@ -35,16 +89,14 @@ def load_and_prepare_data():
             if col in df_projects.columns: df_projects[col] = pd.to_datetime(df_projects[col], errors='coerce')
         for col in ['create_date', 'date_deadline', 'date_end']:
             if col in df_tasks.columns: df_tasks[col] = pd.to_datetime(df_tasks[col], errors='coerce')
-
+    
     if not df_tasks.empty:
-        if 'date_deadline' in df_tasks.columns:
-            df_tasks['date_deadline'] = pd.to_datetime(df_tasks['date_deadline'], errors='coerce')
-        else:
-            df_tasks['date_deadline'] = pd.NaT
-        if 'create_date' in df_tasks.columns:
-            df_tasks['create_date'] = pd.to_datetime(df_tasks['create_date'], errors='coerce')
-        else:
-            df_tasks['create_date'] = pd.NaT
+        # Conversão de datas
+        for col_date in ['create_date', 'date_deadline', 'date_end']:
+            if col_date in df_tasks.columns:
+                df_tasks[col_date] = pd.to_datetime(df_tasks[col_date], errors='coerce')
+            else:
+                df_tasks[col_date] = pd.NaT
 
         def safe_id_local(v):
             if isinstance(v, (list, tuple)) and v: return v[0]
@@ -59,34 +111,46 @@ def load_and_prepare_data():
         if 'depend_on_ids_list' not in df_tasks.columns:
             df_tasks['depend_on_ids_list'] = [[] for _ in range(len(df_tasks))]
 
-        hoje = pd.Timestamp.now().normalize()
-        if 'state' not in df_tasks.columns:
-            df_tasks['state'] = None
-            df_tasks['is_open'] = False
-        else:
-            open_task_states = ['01_in_progress','02_changes_requested','03_approved']
+        # Coluna 'is_open' (baseada no 'state' interno do Odoo)
+        # Usada para ver se o Odoo considera a tarefa "ativa" internamente.
+        # '03_approved' pode significar "aprovado para iniciar"; a lógica em classify_task_status_revised
+        # dará preferência ao estágio "Planejada" se aplicável.
+        open_task_states = ['01_in_progress', '02_changes_requested', '03_approved']
+        if 'state' in df_tasks.columns:
             df_tasks['is_open'] = df_tasks['state'].isin(open_task_states)
-
-        if 'date_deadline' not in df_tasks.columns:
-            df_tasks['is_delayed'] = False
         else:
-            df_tasks['is_delayed'] = df_tasks.apply(
-                lambda r: r.get('is_open', False) and pd.notna(r.get('date_deadline')) and r['date_deadline'] < hoje,
-                axis=1
-            )
+            df_tasks['is_open'] = False
+            df_tasks['state'] = None # Garantir que a coluna 'state' exista
 
-        def classify_task_status(r):
-            state_val = r.get('state')
-            is_delayed_val = r.get('is_delayed', False)
-            is_open_val = r.get('is_open', False)
-            if state_val in ['04_done', 'done', '1_done', 'cancel']: return 'Concluída'
-            if is_delayed_val: return 'Atrasada'
-            if is_open_val: return 'Em Andamento'
-            if (pd.notna(r.get('date_deadline')) and r['date_deadline'] >= hoje and not is_open_val) or \
-               (pd.isna(r.get('date_deadline')) and not is_open_val): return 'Planejada'
-            return 'Planejada'
-        df_tasks['status_cat'] = df_tasks.apply(classify_task_status, axis=1)
+        # Nova coluna: 'is_final_state' (Concluída ou Cancelada)
+        concluida_keywords = ['concluíd', 'done', 'finalizad', 'entregue', 'resolvid', 'fechada']
+        cancelada_keywords = ['cancelad', 'arquivada']
+        
+        if 'stage_id_name' not in df_tasks.columns: # Garantir que a coluna exista
+            df_tasks['stage_id_name'] = ''
 
+        df_tasks['is_final_state'] = df_tasks.apply(lambda r:
+            r.get('state') in ['04_done', 'done', '1_done', 'cancel'] or \
+            any(keyword in str(r.get('stage_id_name', '')).lower() for keyword in concluida_keywords) or \
+            any(keyword in str(r.get('stage_id_name', '')).lower() for keyword in cancelada_keywords), axis=1)
+
+        # Nova coluna: 'is_actually_delayed' (Realmente Atrasada)
+        # Uma tarefa está atrasada se não está em estado final E seu prazo passou.
+        df_tasks['is_actually_delayed'] = df_tasks.apply(lambda r:
+            not r['is_final_state'] and \
+            pd.notna(r.get('date_deadline')) and \
+            r['date_deadline'] < hoje, axis=1)
+        
+        # Cálculo do 'status_cat' usando a nova função revisada
+        df_tasks['status_cat'] = df_tasks.apply(lambda row: classify_task_status_revised(row, hoje), axis=1)
+        
+        # Recalcular 'is_delayed' para consistência com 'Atrasada' em status_cat, se necessário em outros lugares
+        # Ou usar 'is_actually_delayed' diretamente onde for preciso.
+        # A coluna 'is_delayed' original não será mais usada para determinar o status do projeto.
+        # Vamos manter o nome da coluna 'is_actually_delayed' para clareza nas funções subsequentes.
+
+
+        # Função recalc (cálculo de datas de início com base em dependências)
         def recalc(df):
             if 'id' not in df.columns or df.empty:
                 df['calculated_start'] = pd.NaT
@@ -107,19 +171,31 @@ def load_and_prepare_data():
                     if pd.isna(dependency_deadline):
                         dependency_start_date = find_start(dep_id, seen_tasks.copy())
                         if pd.notna(dependency_start_date):
-                            duration_days = current_task_record.get('duration_expected_days', 7) 
+                            # Usar uma duração padrão se não houver 'duration_expected_days'
+                            duration_days = current_task_record.get('duration_expected_days', 1) # Alterado para 1 dia mínimo
+                            if not isinstance(duration_days, (int, float)) or duration_days <= 0:
+                                duration_days = 1 # Garantir duração positiva
                             dependency_deadline = dependency_start_date + timedelta(days=duration_days)
                     if pd.notna(dependency_deadline) and \
                        (pd.isna(latest_dependency_end_date) or dependency_deadline > latest_dependency_end_date):
                         latest_dependency_end_date = dependency_deadline
                 return (latest_dependency_end_date + timedelta(days=1)) if pd.notna(latest_dependency_end_date) else current_task_record.get('create_date')
-            if not df_copy.empty: df_copy['calculated_start'] = [find_start(i) for i in df_copy.index]
+            
+            if not df_copy.empty: 
+                # Garantir que as colunas necessárias para find_start existam
+                if 'create_date' not in df_copy.columns: df_copy['create_date'] = pd.NaT
+                if 'date_deadline' not in df_copy.columns: df_copy['date_deadline'] = pd.NaT
+                if 'depend_on_ids_list' not in df_copy.columns: 
+                    df_copy['depend_on_ids_list'] = [[] for _ in range(len(df_copy))]
+
+                df_copy['calculated_start'] = [find_start(i) for i in df_copy.index]
             else:
                 if 'calculated_start' not in df.columns: df['calculated_start'] = pd.NaT
-                return df
-            return df_copy.reset_index()
+                # return df # Não retornar aqui, pois o df_copy pode ter sido modificado.
+            return df_copy.reset_index() if not df_copy.empty else df
         df_tasks = recalc(df_tasks)
 
+    # Merge com informações do projeto e nomes de dependências (sem alterações aqui)
     if not df_projects.empty and not df_tasks.empty:
         if 'project_id_id' in df_tasks.columns and 'id' in df_projects.columns and \
            'department' in df_projects.columns and 'name' in df_projects.columns:
@@ -149,12 +225,15 @@ def load_and_prepare_data():
         df_tasks['depend_on_names'] = df_tasks['depend_on_ids_list'].apply(
             lambda dep_ids_list: [task_names.get(d_id, f"ID:{d_id}") for d_id in dep_ids_list if isinstance(dep_ids_list, list)] if isinstance(dep_ids_list, list) else []
         )
-    elif not df_tasks.empty:
+    elif not df_tasks.empty: # Garantir que a coluna exista mesmo se vazia
         df_tasks['depend_on_names'] = [[] for _ in range(len(df_tasks))]
+
 
     return df_projects.to_json(date_format='iso', orient='split'), \
            df_tasks.to_json(date_format='iso', orient='split')
 
+
+# === Status geral do projeto (MODIFICADO) ===
 def get_project_overall_status(project_row_input, project_tasks_df_input, project_calculated_end_date=None):
     hoje = pd.Timestamp.now().normalize()
     project_date_start_odoo = pd.to_datetime(project_row_input.get('date_start'), errors='coerce')
@@ -164,67 +243,76 @@ def get_project_overall_status(project_row_input, project_tasks_df_input, projec
 
     has_tasks = not project_tasks_df_input.empty
     project_has_any_delayed_task = False
-    project_has_any_active_task = False # Tarefas 'Em Andamento', 'Atrasada', 'Em Risco'
-    project_all_tasks_are_done = True    # Se não tem tarefas, ou todas são 'Concluída'
-    project_only_has_planned_tasks = False # Se tem tarefas, e todas são 'Planejada'
+    project_has_any_active_task = False
+    project_all_tasks_are_done = True 
+    project_only_has_planned_tasks = False
 
     if has_tasks:
-        if 'is_delayed' in project_tasks_df_input.columns:
-            project_has_any_delayed_task = project_tasks_df_input['is_delayed'].any()
+        # Usar a coluna 'is_actually_delayed' que foi calculada com a nova lógica
+        if 'is_actually_delayed' in project_tasks_df_input.columns:
+            project_has_any_delayed_task = project_tasks_df_input['is_actually_delayed'].any()
         
         if 'status_cat' in project_tasks_df_input.columns:
             task_statuses = project_tasks_df_input['status_cat']
-            active_statuses = ['Em Andamento', 'Atrasada', 'Em Risco']
-            project_has_any_active_task = task_statuses.isin(active_statuses).any()
+            # 'Em Risco' não é um status_cat individual, é um status de projeto derivado de tarefas atrasadas.
+            active_task_statuses_for_project = ['Em Andamento', 'Atrasada'] 
+            project_has_any_active_task = task_statuses.isin(active_task_statuses_for_project).any()
             
-            # Verifica se todas as tarefas são 'Concluída' (nenhuma ativa ou planejada)
-            project_all_tasks_are_done = not task_statuses.isin(active_statuses + ['Planejada']).any()
+            project_all_tasks_are_done = (task_statuses == 'Concluída').all() if not task_statuses.empty else True
 
-            # Verifica se SÓ tem tarefas 'Planejada'
+            # Verifica se SÓ tem tarefas 'Planejada' (e não há ativas ou concluídas)
             if not project_has_any_active_task and not project_all_tasks_are_done:
-                # Isso significa que só podem ser 'Planejada' se não for vazia a lista de status
-                project_only_has_planned_tasks = task_statuses.isin(['Planejada']).all() and not task_statuses.isin(active_statuses + ['Concluída']).any()
-        else: # Fallback se status_cat não estiver disponível
-            project_all_tasks_are_done = False # Não se pode assumir
-            if 'is_open' in project_tasks_df_input.columns:
-                 project_has_any_active_task = project_tasks_df_input['is_open'].any() # Aproximação
+                 project_only_has_planned_tasks = (task_statuses == 'Planejada').all() if not task_statuses.empty else False
+            elif task_statuses.empty : # Se não há tarefas, mas has_tasks é True (DataFrame vazio com colunas)
+                 project_only_has_planned_tasks = False # Ou True, dependendo da interpretação. False é mais seguro.
+                 project_all_tasks_are_done = True # Sem tarefas, pode ser considerado concluído ou planejado.
+        else: 
+            project_all_tasks_are_done = False 
+            # Fallback se 'status_cat' não estiver disponível (improvável com a nova lógica)
+            if 'is_open' in project_tasks_df_input.columns: # 'is_open' do state interno
+                 project_has_any_active_task = project_tasks_df_input['is_open'].any() 
     
-    # Ordem de prioridade para status do projeto:
-    # 1. Atrasada (Vermelho)
-    has_pending_work = project_has_any_active_task or (project_only_has_planned_tasks and has_tasks)
+    # Lógica de prioridade para status do projeto:
+    has_pending_work = project_has_any_active_task or (project_only_has_planned_tasks and has_tasks and not project_all_tasks_are_done)
+    
+    # 1. Atrasada (Vermelho) - Se o projeto tem prazo final e este passou, e ainda há trabalho pendente.
     if pd.notna(effective_project_end_date) and effective_project_end_date < hoje and has_pending_work:
         return 'Atrasada'
 
-    # 2. Em Risco (Laranja)
-    if project_has_any_delayed_task:
+    # 2. Em Risco (Laranja) - Se o projeto tem QUALQUER tarefa individual atrasada.
+    if project_has_any_delayed_task: # Usa 'is_actually_delayed'
         return 'Em Risco'
 
-    # 3. Concluída (Verde)
-    if project_all_tasks_are_done: # Cobre o caso de não ter tarefas também.
+    # 3. Concluída (Verde) - Se todas as tarefas estão concluídas, ou não há tarefas.
+    if project_all_tasks_are_done: 
         return 'Concluída'
         
-    # 4. Planejado (Cinza) - Condição específica do usuário
-    # Se o projeto não tem tarefas OU (tem tarefas E todas são 'Planejada'),
-    # E NÃO se enquadrou em Atrasado, Em Risco, Concluído.
-    if (not has_tasks) or (has_tasks and project_only_has_planned_tasks):
+    # 4. Planejada (Cinza)
+    # Se não tem tarefas ativas (Em Andamento, Atrasada), e não está tudo concluído,
+    # E (ou não tem tarefas, ou todas as que tem são 'Planejada')
+    if (not has_tasks and pd.isna(project_date_start_odoo)) or \
+       (not has_tasks and pd.notna(project_date_start_odoo) and project_date_start_odoo > hoje) or \
+       (has_tasks and project_only_has_planned_tasks):
         return 'Planejada'
 
     # 5. Em Andamento (Amarelo)
-    if project_has_any_active_task: # Se tem tarefas ativas (Em Andamento, Atrasada já foi pego por Em Risco)
+    if project_has_any_active_task: # Se tem tarefas 'Em Andamento' ou 'Atrasada' (Atrasada já teria virado 'Em Risco' acima, mas mantém aqui para lógica de atividade)
         return 'Em Andamento'
     
-    # Se chegou aqui, pode ser um projeto com data de início passada mas sem tarefas ativas (ex: só planejadas, já coberto acima)
-    # ou tarefas planejadas e data de início futura.
-    if pd.notna(project_date_start_odoo) and project_date_start_odoo > hoje: # Data de início futura
-        return 'Planejada' # Mesmo que tenha tarefas (que seriam Planejadas), o projeto em si é Planejado
-    
-    # Se a data de início já passou, e não se encaixou em nada acima (ex: tem tarefas mas o status não é claro)
-    # Default para 'Em Andamento' se o projeto já deveria ter começado.
-    if pd.notna(project_date_start_odoo) and project_date_start_odoo <= hoje:
-        return 'Em Andamento'
+    # 6. Casos de Borda para Planejada ou Em Andamento baseado na data de início do projeto
+    if pd.notna(project_date_start_odoo):
+        if project_date_start_odoo > hoje and not has_pending_work: # Início futuro e sem trabalho ativo/pendente
+            return 'Planejada'
+        elif project_date_start_odoo <= hoje and not has_pending_work and not project_all_tasks_are_done : # Já deveria ter começado, sem trabalho ativo mas não concluído (ex: só tarefas planejadas, mas o projeto em si deveria estar "em andamento" por ter iniciado)
+             # Se chegou aqui e tem tarefas, e project_only_has_planned_tasks foi False, mas não há active_tasks,
+             # é uma situação estranha. Mas se só tem planejadas, o item 4 já pegou.
+             # Se já começou e não tem tarefas ativas, mas tem tarefas planejadas, o item 4 já tratou.
+             # Se já começou e não tem tarefas, o item 4 (sem tarefas com início futuro) ou 3 (sem tarefas = concluído) deveria tratar.
+             # Este fallback é para garantir que se o projeto iniciou e não caiu nas outras categorias, ele é 'Em Andamento'.
+             return 'Em Andamento'
 
-    return 'Planejada' # Default final
 
+    return 'Planejada'
 
 def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
     hoje = pd.Timestamp.now().normalize()
@@ -314,7 +402,7 @@ def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
             df_tasks_for_gantt['__order'] = df_tasks_for_gantt['id'].apply(lambda i: order_gantt.index(i) if i in order_gantt else float('inf'))
             df_tasks_for_gantt = df_tasks_for_gantt[df_tasks_for_gantt['__order'] != float('inf')]
         elif not df_tasks_for_gantt.empty:
-             df_tasks_for_gantt['__order'] = range(len(df_tasks_for_gantt))
+            df_tasks_for_gantt['__order'] = range(len(df_tasks_for_gantt))
         full_df_for_gantt = pd.concat([project_bar.assign(__order=-1), df_tasks_for_gantt], ignore_index=True).sort_values('__order')
 
     fig = px.timeline(
@@ -324,7 +412,7 @@ def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
     )
     fig.update_layout(
         yaxis={'autorange': 'reversed'}, 
-        yaxis_title="Nome dos Projetos/Tarefas", # Título do eixo Y adicionado
+        yaxis_title="Nome dos Projetos/Tarefas",
         plot_bgcolor='white', 
         paper_bgcolor=BG, 
         margin=dict(t=50), 
@@ -332,6 +420,7 @@ def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
     )
     if 'display_name' in full_df_for_gantt.columns and not full_df_for_gantt['display_name'].empty:
         fig.update_yaxes(categoryorder='array', categoryarray=full_df_for_gantt['display_name'].tolist())
+    
     if not df_tasks_for_gantt.empty:
         coord_map = {r['id']: (r['end'], r['display_name']) for _, r in full_df_for_gantt.iterrows() if pd.notna(r.get('id')) and pd.notna(r.get('end')) and pd.notna(r.get('display_name')) and r.get('id') != pid}
         for _, r_task in full_df_for_gantt.iterrows():
@@ -341,6 +430,7 @@ def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
                     if dep_id in coord_map:
                         x0, y0 = coord_map[dep_id]
                         fig.add_annotation(x=r_task['start'], y=r_task['display_name'], ax=x0, ay=y0, xref='x', yref='y', axref='x', ayref='y', showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=1.5, arrowcolor='#666')
+        
         if 'tree_gantt' in locals() and tree_gantt:
             for parent_id, children_ids in tree_gantt.items():
                 if children_ids and parent_id in full_df_for_gantt['id'].values:
@@ -349,8 +439,22 @@ def generate_full_gantt(df_sel_tasks, pid, all_projects_df):
                         parent_row = parent_row_df.iloc[0]
                         if pd.notna(parent_row.get('start')) and pd.notna(parent_row.get('end')) and pd.notna(parent_row.get('display_name')):
                             fig.add_shape(type='line', x0=parent_row['start'], x1=parent_row['end'], y0=parent_row['display_name'], y1=parent_row['display_name'], xref='x', yref='y', line=dict(color='black', width=3))
+
+    # ***** INÍCIO DA MODIFICAÇÃO *****
+    # Adiciona um trace invisível para a legenda da "Tarefa Pai (linha preta)"
+    fig.add_trace(go.Scatter(
+        x=[None],  # Sem pontos de dados reais
+        y=[None],
+        mode='lines',
+        line=dict(color='black', width=3),
+        name='Tarefa Pai (linha preta)', # Texto da legenda
+        showlegend=True
+    ))
+    # ***** FIM DA MODIFICAÇÃO *****
+            
     fig.add_shape(type='line', x0=hoje, x1=hoje, y0=0, y1=1, xref='x', yref='paper', line_dash='dash', line_color='green')
     fig.add_annotation(x=hoje, y=1, xref='x', yref='paper', text='Hoje', showarrow=False, yanchor='bottom', align='right')
+    
     return fig
 
 def compute_depths(df_indexed_tasks):
@@ -439,10 +543,10 @@ def generate_dept_gantt(all_tasks_df, selected_projects_df, show_tasks=False):
         return fig
     full_gantt_data_dept = pd.concat(gantt_data_list, ignore_index=True)
     full_gantt_data_dept = full_gantt_data_dept.sort_values('__overall_order').reset_index(drop=True)
-    fig = px.timeline(full_gantt_data_dept, x_start='start', x_end='end', y='display_name', color='status_cat', color_discrete_map={'Concluída': DONE, 'Em Andamento': ACCENT, 'Atrasada': DELAYED, 'Planejada': PLANNED, 'Em Risco': WARNING}, labels={'status_cat': 'Legenda'})
+    fig = px.timeline(full_gantt_data_dept, x_start='start', x_end='end', y='display_name', color='status_cat', color_discrete_map={'Concluída': DONE, 'Em Andamento': ACCENT, 'Atrasada': DELAYED, 'Planejada': PLANNED, 'Em Risco': WARNING, 'Tarefa-Pai': "-"}, labels={'status_cat': 'Legenda'}) # Note: 'Tarefa-Pai': "-" might not render a black line directly in legend.
     fig.update_layout(
         yaxis={'autorange': 'reversed'}, 
-        yaxis_title="Nome dos Projetos/Tarefas", # Título do eixo Y adicionado
+        yaxis_title="Nome dos Projetos/Tarefas",
         plot_bgcolor='white', 
         paper_bgcolor=BG, 
         margin=dict(t=50), 
@@ -552,13 +656,16 @@ def update_gantt_and_table_callback(dept_val_gantt, pid_val_gantt, stored_projec
         if 'project_id_id' in all_tasks_cb.columns and not all_tasks_cb.empty:
             df_sel_gantt_tasks_cb = all_tasks_cb[all_tasks_cb['project_id_id'] == pid_val_gantt].copy()
         df_sel_table_cb = df_sel_gantt_tasks_cb.copy()
-        if pid_val_gantt in all_projects_cb['id'].values: current_fig = generate_full_gantt(df_sel_gantt_tasks_cb, pid_val_gantt, all_projects_cb)
+        if 'id' in all_projects_cb.columns and pid_val_gantt in all_projects_cb['id'].values: current_fig = generate_full_gantt(df_sel_gantt_tasks_cb, pid_val_gantt, all_projects_cb)
         else: current_fig = fig_default.update_layout(title=f"Projeto ID {pid_val_gantt} não encontrado nos dados carregados.")
     elif dept_val_gantt:
-        df_proj_in_dept_cb = all_projects_cb[all_projects_cb['department'] == dept_val_gantt]
+        df_proj_in_dept_cb = pd.DataFrame()
+        if 'department' in all_projects_cb.columns:
+             df_proj_in_dept_cb = all_projects_cb[all_projects_cb['department'] == dept_val_gantt]
+
         if df_proj_in_dept_cb.empty: current_fig.update_layout(title=f"Nenhum projeto encontrado para o departamento '{dept_val_gantt}'.", yaxis_visible=False, xaxis_visible=False)
         else:
-            if 'project_id_id' in all_tasks_cb.columns and not all_tasks_cb.empty:
+            if 'project_id_id' in all_tasks_cb.columns and not all_tasks_cb.empty and 'id' in df_proj_in_dept_cb.columns:
                 df_sel_table_cb = all_tasks_cb[all_tasks_cb['project_id_id'].isin(df_proj_in_dept_cb['id'])].copy() 
             current_fig = generate_dept_gantt(all_tasks_cb, df_proj_in_dept_cb, show_tasks=False)
     table_data_cb = []
@@ -599,11 +706,20 @@ def update_summary_callback(tab_val, stored_projects_json, stored_tasks_json):
         for col_name in status_map_for_summary.values():
             if col_name not in df_task_counts_per_project: df_task_counts_per_project[col_name] = 0
         task_sum_cols = [col for col in status_map_for_summary.values() if col in df_task_counts_per_project.columns]
-        df_task_counts_per_project['total_tasks'] = df_task_counts_per_project[task_sum_cols].sum(axis=1)
+        if task_sum_cols : df_task_counts_per_project['total_tasks'] = df_task_counts_per_project[task_sum_cols].sum(axis=1)
+        else: df_task_counts_per_project['total_tasks'] = 0 # Handle if no status columns exist
         df_task_counts_per_project = df_task_counts_per_project.reset_index()
+    
     df_summary_merged = pd.DataFrame()
     if 'id' in df_projects_sum.columns and 'department' in df_projects_sum.columns:
-        df_summary_merged = pd.merge(df_projects_sum[['id', 'department']], df_task_counts_per_project, left_on='id', right_on='project_id_id', how='left')
+        if not df_task_counts_per_project.empty:
+             df_summary_merged = pd.merge(df_projects_sum[['id', 'department']], df_task_counts_per_project, left_on='id', right_on='project_id_id', how='left')
+        else: # No tasks, just use projects data for department counts
+             df_summary_merged = df_projects_sum[['id', 'department']].copy()
+             if 'project_id_id' not in df_summary_merged.columns: # Ensure column for consistency if no tasks
+                 df_summary_merged['project_id_id'] = df_summary_merged['id']
+
+
         task_count_cols_to_fill = list(status_map_for_summary.values()) + ['total_tasks']
         for col in task_count_cols_to_fill:
             if col in df_summary_merged.columns: df_summary_merged[col] = df_summary_merged[col].fillna(0).astype(int)
@@ -611,22 +727,34 @@ def update_summary_callback(tab_val, stored_projects_json, stored_tasks_json):
     else: 
         print("ATENÇÃO: 'id' ou 'department' faltando em df_projects_sum para resumo.")
         return fig_empty_summary_cb.update_layout(title='Dados de projetos incompletos para resumo.')
+
     df_summary_by_dept = pd.DataFrame()
-    if 'department' in df_summary_merged.columns:
+    if 'department' in df_summary_merged.columns and not df_summary_merged.empty:
         df_proj_counts_by_dept = df_projects_sum.groupby('department').size().reset_index(name='num_projects')
         sum_cols_for_dept_group = [col for col in task_count_cols_to_fill if col in df_summary_merged.columns]
-        if sum_cols_for_dept_group: df_grouped_tasks_by_dept = df_summary_merged.groupby('department')[sum_cols_for_dept_group].sum().reset_index()
-        else:
+        
+        if sum_cols_for_dept_group: 
+            df_grouped_tasks_by_dept = df_summary_merged.groupby('department')[sum_cols_for_dept_group].sum().reset_index()
+        else: # No task columns to sum, create empty sums
             df_grouped_tasks_by_dept = pd.DataFrame({'department': df_summary_merged['department'].unique()})
-            for col_s in sum_cols_for_dept_group: df_grouped_tasks_by_dept[col_s] = 0
-        if not df_proj_counts_by_dept.empty: df_summary_by_dept = pd.merge(df_proj_counts_by_dept, df_grouped_tasks_by_dept, on='department', how='left').fillna(0)
-        elif not df_grouped_tasks_by_dept.empty :
-             df_summary_by_dept = df_grouped_tasks_by_dept
-             if 'num_projects' not in df_summary_by_dept.columns: df_summary_by_dept['num_projects'] = 0
+            for col_s in sum_cols_for_dept_group: df_grouped_tasks_by_dept[col_s] = 0 # Will be empty if sum_cols_for_dept_group is empty
+        
+        if not df_proj_counts_by_dept.empty: 
+            df_summary_by_dept = pd.merge(df_proj_counts_by_dept, df_grouped_tasks_by_dept, on='department', how='left').fillna(0)
+            # Ensure all numeric columns are int if they were float due to merge/fillna
+            for col in df_summary_by_dept.columns:
+                if df_summary_by_dept[col].dtype == 'float64':
+                    df_summary_by_dept[col] = df_summary_by_dept[col].astype(int)
+        elif not df_grouped_tasks_by_dept.empty : # Only task data available, no project counts per se
+            df_summary_by_dept = df_grouped_tasks_by_dept
+            if 'num_projects' not in df_summary_by_dept.columns: df_summary_by_dept['num_projects'] = 0 # Add num_projects if missing
+    
     if df_summary_by_dept.empty or 'department' not in df_summary_by_dept.columns: return fig_empty_summary_cb.update_layout(title='Não foi possível construir o resumo por departamento.')
+    
     plot_metrics_map = {'num_projects':'Projetos', 'total_tasks':'Total Tarefas', 'inprogress_tasks':'Tarefas em Andamento', 'delayed_tasks_individual':'Tarefas Atrasadas', 'planned_tasks':'Tarefas Planejadas', 'done_tasks':'Tarefas Concluídas'}
     plot_cols = [col for col in plot_metrics_map.keys() if col in df_summary_by_dept.columns]
     if not plot_cols: return fig_empty_summary_cb.update_layout(title='Métricas de resumo não encontradas para plotagem.')
+    
     fig_summary = px.bar(df_summary_by_dept, x='department', y=plot_cols, barmode='group', labels={'department':'Departamento','value':'Quantidade','variable':'Métrica'}, color_discrete_map={'num_projects':PRIMARY, 'total_tasks':LIGHT_BLUE, 'inprogress_tasks':ACCENT, 'delayed_tasks_individual':DELAYED, 'planned_tasks':PLANNED, 'done_tasks':DONE})
     fig_summary.for_each_trace(lambda t: t.update(name=plot_metrics_map.get(t.name, t.name)))
     fig_summary.update_layout(plot_bgcolor='white', paper_bgcolor=BG, legend_title_text='Métricas de Tarefas', xaxis_title='Departamento', yaxis_title='Quantidade')
